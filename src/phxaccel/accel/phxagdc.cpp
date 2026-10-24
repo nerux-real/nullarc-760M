@@ -35,7 +35,7 @@ static_assert(sizeof(PhxAGDCVendorInfo) == 0x2c, "AGDCVendorInfo_t is 0x2c");
 static_assert(sizeof(PhxAGDCGPUCapability) == 0xdc, "AGDCGPUCapability_t is 0xdc");
 
 static IOService *gPci = nullptr, *gFB = nullptr;   // held while the service is up
-static SInt64 gCmds = 0, gRefused = 0, gFbReplies = 0, gK5 = 0;
+static SInt64 gBenign = 0, gCmds = 0, gRefused = 0, gFbReplies = 0, gK5 = 0;
 static int gLastRefused = 0, gLogged = 0;
 
 // The header sizes the base as 0x110 (15.7.9); the padding keeps a larger Tahoe base inside this object, and
@@ -114,6 +114,17 @@ IOReturn PhxDeviceControl::vendor_doDeviceAttribute(unsigned int cmd, unsigned l
         if (gLogged < 400) { gLogged++; AGLOG("command %#x not answered (result %d, why %#x)", cmd, r, why); }
         if (r == NVK5_R_BADARG) return kIOReturnBadArgument;
         if (r == NVK5_R_NOTFOUND) return kIOReturnNotFound;
+        // other plane capabilities than the scaler: "none" (count 0) instead of an error, so CoreDisplay keeps the display
+        if (cmd == NVK5_CMD_FBCAPEX && r == NVK5_R_UNSUPPORTED && in && out && outSize && *outSize == sizeof(NVAGDCFBExtCap)) {
+            bzero(out, *outSize); memcpy(out, in, 8); return kIOReturnSuccess;
+        }
+    }
+    // 26.7: CoreDisplay_CreateDisplay... gave the display id 0 right after these refusals. Commands we do not know answer
+    // "done" with zeroed output rather than Unsupported (experiment; 0x2001 takes 4 bytes in and returns nothing).
+    if (cmd == 0x2001 || cmd == 0x925 || cmd == 0x941 || cmd == 0x3) {
+        if (out && outSize && *outSize) bzero(out, *outSize);
+        if (OSAddAtomic64(1, &gBenign) < 6) AGLOG("command %#x answered with success (unknown command, zeroed output)", cmd);
+        return kIOReturnSuccess;
     }
     OSAddAtomic64(1, &gRefused); gLastRefused = (int)cmd;
     if (gLogged < 400) { gLogged++; AGLOG("command %#x (in %lu bytes) -> Unsupported [%d/400]", cmd, inSize, gLogged); }
