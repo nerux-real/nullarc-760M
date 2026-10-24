@@ -1,0 +1,29 @@
+name: build-bluetooth
+# MediaTek MT7925 Bluetooth: MtkBt (firmware loader) + LegionBtFix (bluetoothd patches, macOS 26.7.1 25G241 only)
+on:
+  workflow_dispatch:
+  push:
+    paths: ['extras/**', '.github/workflows/build-bt.yml']
+jobs:
+  build:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build MtkBt
+        working-directory: extras/mtkbt
+        run: tools/build-mac.sh
+      - name: Build LegionBtFix (against Lilu 1.7.3, the version in the EFI)
+        working-directory: extras/legionbtfix
+        run: |
+          git clone -q --depth 1 --branch 1.7.3 https://github.com/acidanthera/Lilu Lilu
+          tools/build-mac.sh
+      - name: Collect
+        run: |
+          mkdir -p bt
+          cp -R extras/mtkbt/out/MtkBt.kext bt/
+          cp -R extras/legionbtfix/out/LegionBtFix.kext bt/
+          cp -R extras/mtkbt/LICENSE extras/mtkbt/NOTICE.md extras/mtkbt/LICENSES bt/
+      - uses: actions/upload-artifact@v4
+        with:
+          name: bluetooth
+          path: bt
