@@ -119,11 +119,16 @@ IOReturn PhxDeviceControl::vendor_doDeviceAttribute(unsigned int cmd, unsigned l
             bzero(out, *outSize); memcpy(out, in, 8); return kIOReturnSuccess;
         }
     }
-    // 26.7: CoreDisplay_CreateDisplay... gave the display id 0 right after these refusals. Commands we do not know answer
-    // "done" with zeroed output rather than Unsupported (experiment; 0x2001 takes 4 bytes in and returns nothing).
-    if (cmd == 0x2001 || cmd == 0x925 || cmd == 0x941 || cmd == 0x3) {
-        if (out && outSize && *outSize) bzero(out, *outSize);
-        if (OSAddAtomic64(1, &gBenign) < 6) AGLOG("command %#x answered with success (unknown command, zeroed output)", cmd);
+    // 26.7 asks 0x925 (12 bytes in, 12 out, w0 = 1) before the display is built. Answered with zeros, CoreDisplay logs
+    // IOPRESENTMENT_CAPABILITIES_MALFORMED (2026-10-24); refused, the capabilities are missing. So 0x925 is a capabilities
+    // query of an unknown layout: echo the input as a first guess. 0x2001 (4 bytes in, none out) is acknowledged.
+    if (cmd == 0x925 && in && out && outSize && inSize == 12 && *outSize == 12) {
+        memcpy(out, in, 12);
+        if (OSAddAtomic64(1, &gBenign) < 6) AGLOG("command 0x925 answered by echoing its 12 input bytes");
+        return kIOReturnSuccess;
+    }
+    if (cmd == 0x2001) {
+        if (OSAddAtomic64(1, &gBenign) < 6) AGLOG("command 0x2001 acknowledged");
         return kIOReturnSuccess;
     }
     OSAddAtomic64(1, &gRefused); gLastRefused = (int)cmd;
