@@ -83,6 +83,9 @@ for n in NVMTLDriver.bundle nvmtl; do
     rm -rf "$H/.$n.old.$TS"
 done
 chown -R root:wheel "$H"
+# WindowServer (_windowserver) loads this bundle too: a package unpacked with a restrictive umask leaves it root-only, and
+# CoreDisplay then asserts "Failed to create MetalDevice"
+chmod -R go-w,a+rX "$H"
 codesign --force --sign - "$H/NVMTLDriver.bundle" >/dev/null 2>&1
 codesign --verify --strict "$H/NVMTLDriver.bundle" && say "  plugin signature ok"
 mkdir -p "$L"
