@@ -26,6 +26,10 @@ void phxAgdcRemove();
 void phxHoldInit(IOService *fb, unsigned bootHoldSec);   // phxagdc.cpp: debug.phxfb_hold keeps this framebuffer (and so the GPU) busy
 
 #define PFBLOG(fmt, ...) IOLog("PhxFB: " fmt "\n", ##__VA_ARGS__)
+// experiment switches without a rebuild: `sudo nvram phxfb-x=<n>` (read at start, kept). bit 0: panel reported as external.
+static uint32_t gPhxX = 0;
+static volatile SInt32 gTrace = 0;
+#define PTR(fmt, ...) do { if (OSIncrementAtomic(&gTrace) < 600) IOLog("PhxFB: [t] " fmt "\n", ##__VA_ARGS__); } while (0)
 
 static int gAlias = 1;
 static bool gAliasSysctl;
@@ -274,8 +278,8 @@ public:
     }
     IODeviceMemory *getVRAMRange() override { return getApertureRange(kIOFBSystemAperture); }
     const char *getPixelFormats() override { return IO32BitDirectPixels "\0"; }
-    IOItemCount getDisplayModeCount() override { return 1; }
-    IOReturn getDisplayModes(IODisplayModeID *modes) override { modes[0] = 1; return kIOReturnSuccess; }
+    IOItemCount getDisplayModeCount() override { PTR("getDisplayModeCount"); return 1; }
+    IOReturn getDisplayModes(IODisplayModeID *modes) override { PTR("getDisplayModes"); modes[0] = 1; return kIOReturnSuccess; }
     IOReturn getInformationForDisplayMode(IODisplayModeID mode, IODisplayModeInformation *info) override {
         // WindowServer failed "obtain mode info" with the single id 1 on 26.7: answer for any id and log which it asked for
         static int n; if (n++ < 20) PFBLOG("getInformationForDisplayMode(%#x)", (unsigned)mode);
@@ -297,7 +301,7 @@ public:
         pi->activeWidth = fWidth; pi->activeHeight = fHeight;
         return kIOReturnSuccess;
     }
-    IOReturn getCurrentDisplayMode(IODisplayModeID *mode, IOIndex *depth) override { *mode = 1; *depth = 0; return kIOReturnSuccess; }
+    IOReturn getCurrentDisplayMode(IODisplayModeID *mode, IOIndex *depth) override { PTR("getCurrentDisplayMode"); *mode = 1; *depth = 0; return kIOReturnSuccess; }
     IOReturn getStartupDisplayMode(IODisplayModeID *mode, IOIndex *depth) override { return getCurrentDisplayMode(mode, depth); }
     IOReturn setDisplayMode(IODisplayModeID mode, IOIndex depth) override { PFBLOG("setDisplayMode(%#x, %d)", (unsigned)mode, (int)depth); return kIOReturnSuccess; }
     IOReturn getTimingInfoForDisplayMode(IODisplayModeID mode, IOTimingInformation *info) override {
@@ -385,6 +389,7 @@ public:
         return kIOPMAckImplied;
     }
     IOReturn setAttribute(IOSelect attribute, uintptr_t value) override {
+        PTR("setAttribute('%c%c%c%c', %#lx)", (char)(attribute >> 24), (char)(attribute >> 16), (char)(attribute >> 8), (char)attribute, (unsigned long)value);
         if (attribute == kIOWindowServerActiveAttribute) return kIOReturnSuccess;
         if (attribute == kIOPowerAttribute) {
             if (value) { IOReturn r = IOFramebuffer::setAttribute(attribute, value); handleEvent(kIOFBNotifyDidPowerOn);
@@ -396,10 +401,12 @@ public:
         return IOFramebuffer::setAttribute(attribute, value);
     }
     IOReturn getAttribute(IOSelect attribute, uintptr_t *value) override {
+        PTR("getAttribute('%c%c%c%c')", (char)(attribute >> 24), (char)(attribute >> 16), (char)(attribute >> 8), (char)attribute);
         if (attribute == kIOWindowServerActiveAttribute) { if (value) *value = 1; return kIOReturnSuccess; }
         return IOFramebuffer::getAttribute(attribute, value);
     }
     IOReturn setAttributeForConnection(IOIndex idx, IOSelect attribute, uintptr_t value) override {
+        PTR("setAttributeForConnection(%d, '%c%c%c%c', %#lx)", (int)idx, (char)(attribute >> 24), (char)(attribute >> 16), (char)(attribute >> 8), (char)attribute, (unsigned long)value);
         switch (attribute) {
         case kConnectionPower: case kConnectionColorModesSupported: case kConnectionColorDepthsSupported:
         case kConnectionControllerColorDepth: case kConnectionControllerDepthsSupported: case kConnectionColorMode:
@@ -409,24 +416,22 @@ public:
         }
     }
     IOReturn getAttributeForConnection(IOIndex idx, IOSelect attr, uintptr_t *value) override {
+        PTR("getAttributeForConnection(%d, '%c%c%c%c')", (int)idx, (char)(attr >> 24), (char)(attr >> 16), (char)(attr >> 8), (char)attr);
         if (idx != 0) return kIOReturnBadArgument;
         // AppleDisplay asks kConnectionSupportsHLDDCSense with a NULL value before it reads the EDID: answer it first
         if (attr == kConnectionSupportsHLDDCSense) return kIOReturnSuccess;
         if (!value) return kIOReturnBadArgument;
         switch (attr) {
         case kConnectionEnable: case kConnectionCheckEnable: *value = 1; return kIOReturnSuccess;
-        case kConnectionFlags: *value = kIOConnectionBuiltIn; return kIOReturnSuccess;
+        case kConnectionFlags: *value = (gPhxX & 1) ? 0 : kIOConnectionBuiltIn; return kIOReturnSuccess;
         case kConnectionColorModesSupported: case kConnectionColorMode: *value = 0x00000001; return kIOReturnSuccess;
         case kConnectionColorDepthsSupported: case kConnectionControllerColorDepth: case kConnectionControllerDepthsSupported:
             *value = 0x00000002; return kIOReturnSuccess;
-        default: {
-            static int n; if (n++ < 40) PFBLOG("getAttributeForConnection(%d, '%c%c%c%c') -> base", (int)idx,
-                (char)(attr >> 24), (char)(attr >> 16), (char)(attr >> 8), (char)attr);
-            return IOFramebuffer::getAttributeForConnection(idx, attr, value);
-        }
+        default: return IOFramebuffer::getAttributeForConnection(idx, attr, value);
         }
     }
-    IOReturn connectFlags(IOIndex, IODisplayModeID, IOOptionBits *flags) override {
+    IOReturn connectFlags(IOIndex c, IODisplayModeID m, IOOptionBits *flags) override {
+        PTR("connectFlags(%d, %#x)", (int)c, (unsigned)m);
         if (flags) *flags = kDisplayModeValidFlag | kDisplayModeSafeFlag | kDisplayModeDefaultFlag;
         return kIOReturnSuccess;
     }
@@ -523,10 +528,25 @@ static bool takeBootArming()
     return armed && !stuck;
 }
 
+static void readExperimentSwitch()
+{
+    IORegistryEntry *opts = IORegistryEntry::fromPath("/options", gIODTPlane);
+    if (!opts) return;
+    OSObject *o = opts->copyProperty("phxfb-x");
+    char buf[16] = {0};
+    if (OSData *d = OSDynamicCast(OSData, o)) { unsigned n = d->getLength() < 15 ? d->getLength() : 15; memcpy(buf, d->getBytesNoCopy(), n); }
+    else if (OSString *st = OSDynamicCast(OSString, o)) strlcpy(buf, st->getCStringNoCopy(), sizeof buf);
+    else if (OSNumber *nn = OSDynamicCast(OSNumber, o)) snprintf(buf, sizeof buf, "%u", nn->unsigned32BitValue());
+    OSSafeReleaseNULL(o); opts->release();
+    uint32_t v = 0; for (const char *c = buf; *c >= '0' && *c <= '9'; c++) v = v * 10 + (uint32_t)(*c - '0');
+    gPhxX = v; PFBLOG("experiment switch phxfb-x = %u", v);
+}
+
 bool PhxAMDFB::start(IOService *provider)
 {
     char arg[8];
     if (PE_parse_boot_argn("-phxfboff", arg, sizeof arg)) { PFBLOG("-phxfboff: leaving the firmware framebuffer"); return false; }
+    readExperimentSwitch();
     if (!takeBootArming()) { PFBLOG("NVRAM phxfb-boot not set: leaving the firmware framebuffer this boot"); return false; }
     fPCI = OSDynamicCast(IOPCIDevice, provider);
     if (!fPCI) return false;

@@ -114,29 +114,6 @@ IOReturn PhxDeviceControl::vendor_doDeviceAttribute(unsigned int cmd, unsigned l
         if (gLogged < 400) { gLogged++; AGLOG("command %#x not answered (result %d, why %#x)", cmd, r, why); }
         if (r == NVK5_R_BADARG) return kIOReturnBadArgument;
         if (r == NVK5_R_NOTFOUND) return kIOReturnNotFound;
-        // other plane capabilities than the scaler: "none" (count 0) instead of an error, so CoreDisplay keeps the display
-        if (cmd == NVK5_CMD_FBCAPEX && r == NVK5_R_UNSUPPORTED && in && out && outSize && *outSize == sizeof(NVAGDCFBExtCap)) {
-            bzero(out, *outSize); memcpy(out, in, 8); return kIOReturnSuccess;
-        }
-    }
-    // 26.7 asks 0x925 (12 bytes in, 12 out, w0 = 1) before the display is built. Answered with zeros, CoreDisplay logs
-    // IOPRESENTMENT_CAPABILITIES_MALFORMED (2026-10-24); refused, the capabilities are missing. So 0x925 is a capabilities
-    // query of an unknown layout: echo the input as a first guess. 0x2001 (4 bytes in, none out) is acknowledged.
-    if (cmd == 0x925 && in && out && outSize && inSize == 12 && *outSize == 12) {
-        // probe: each call answers with the next candidate; WindowServer logs IOPRESENTMENT_CAPABILITIES_MALFORMED after the
-        // ones it rejects, so the candidate with no such line after it is the layout (matched by time)
-        static const uint32_t cand[][3] = {
-            {1,0,1},{1,1,0},{1,1,1},{1,12,0},{1,12,1},{1,2,0},{1,3,0},{1,4,0},{1,8,0},{1,0,2},{1,0,4},{1,0xff,0xff},
-            {0,1,1},{2,0,0},{3,0,0},{0,0,1},{0,1,0},{12,1,0},{0x10,0,0},{1,0x10,0},{1,0,0x10},{1,0x100,0},{1,0,0x100},{0xffffffff,0xffffffff,0xffffffff} };
-        const unsigned n = (unsigned)(sizeof cand / sizeof cand[0]);
-        const unsigned k = (unsigned)OSAddAtomic64(1, &gBenign) % n;
-        memcpy(out, cand[k], 12);
-        AGLOG("0x925 probe #%u answered {%#x, %#x, %#x}", k, cand[k][0], cand[k][1], cand[k][2]);
-        return kIOReturnSuccess;
-    }
-    if (cmd == 0x2001) {
-        if (OSAddAtomic64(1, &gBenign) < 6) AGLOG("command 0x2001 acknowledged");
-        return kIOReturnSuccess;
     }
     OSAddAtomic64(1, &gRefused); gLastRefused = (int)cmd;
     if (gLogged < 400) { gLogged++; AGLOG("command %#x (in %lu bytes) -> Unsupported [%d/400]", cmd, inSize, gLogged); }
