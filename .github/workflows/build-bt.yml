@@ -7,16 +7,19 @@ on:
 jobs:
   build:
     runs-on: macos-15
+    defaults:
+      run:
+        shell: bash
     steps:
       - uses: actions/checkout@v4
       - name: Build MtkBt
         working-directory: extras/mtkbt
-        run: tools/build-mac.sh
+        run: tools/build-mac.sh 2>&1 | tee ../../mtkbt-build.log; exit ${PIPESTATUS[0]}
       - name: Build LegionBtFix (against Lilu 1.7.3, the version in the EFI)
         working-directory: extras/legionbtfix
         run: |
           git clone -q --depth 1 --branch 1.7.3 https://github.com/acidanthera/Lilu Lilu
-          tools/build-mac.sh
+          tools/build-mac.sh 2>&1 | tee ../../legionbtfix-build.log; exit ${PIPESTATUS[0]}
       - name: Collect
         run: |
           mkdir -p bt
@@ -27,3 +30,8 @@ jobs:
         with:
           name: bluetooth
           path: bt
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: build-logs
+          path: '*.log'
