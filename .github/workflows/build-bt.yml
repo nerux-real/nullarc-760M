@@ -17,10 +17,10 @@ jobs:
       - name: Build MtkBt
         working-directory: extras/mtkbt
         run: tools/build-mac.sh 2>&1 | tee ../../mtkbt-build.log; exit ${PIPESTATUS[0]}
-      - name: Build LegionBtFix (against Lilu 1.7.3, the version in the EFI)
+      - name: Build LegionBtFix (against Lilu 1.7.2 headers, as upstream)
         working-directory: extras/legionbtfix
         run: |
-          git clone -q --depth 1 --branch 1.7.3 https://github.com/acidanthera/Lilu Lilu
+          git clone -q --depth 1 --branch 1.7.2 https://github.com/acidanthera/Lilu Lilu
           tools/build-mac.sh 2>&1 | tee ../../legionbtfix-build.log; exit ${PIPESTATUS[0]}
       - name: Collect
         run: |
