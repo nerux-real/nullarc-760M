@@ -98,7 +98,7 @@ IOReturn PhxDeviceControl::vendor_doDeviceAttribute(unsigned int cmd, unsigned l
     // display pipe; refused, it logged "Unable to acquire capabilities ... 0x80e" and WindowServer composited the panel
     // in software. The firmware lit the panel without telling its timing, so the answer carries the CVT reduced-blanking
     // timing of the mode (NullMoth's K5 replies, nvrm-agdc-k5.h).
-    if (gLogged < 400 && in && inSize >= 4 && inSize < 64) {
+    if (gLogged < 40 && in && inSize >= 4 && inSize < 64) {
         const uint32_t *w = (const uint32_t *)in;
         AGLOG("cmd %#x in=%lu out=%lu w0=%#x w1=%#x w2=%#x", cmd, inSize, outSize ? *outSize : 0ul, w[0], inSize >= 8 ? w[1] : 0, inSize >= 12 ? w[2] : 0);
     }
@@ -111,12 +111,12 @@ IOReturn PhxDeviceControl::vendor_doDeviceAttribute(unsigned int cmd, unsigned l
             if (OSAddAtomic64(1, &gK5) < 8) AGLOG("command %#x answered (%s)", cmd, r == NVK5_R_LINK ? "link config" : "plane scaler");
             return kIOReturnSuccess;
         }
-        if (gLogged < 400) { gLogged++; AGLOG("command %#x not answered (result %d, why %#x)", cmd, r, why); }
+        if (gLogged < 40) { gLogged++; AGLOG("command %#x not answered (result %d, why %#x)", cmd, r, why); }
         if (r == NVK5_R_BADARG) return kIOReturnBadArgument;
         if (r == NVK5_R_NOTFOUND) return kIOReturnNotFound;
     }
     OSAddAtomic64(1, &gRefused); gLastRefused = (int)cmd;
-    if (gLogged < 400) { gLogged++; AGLOG("command %#x (in %lu bytes) -> Unsupported [%d/400]", cmd, inSize, gLogged); }
+    if (gLogged < 40) { gLogged++; AGLOG("command %#x (in %lu bytes) -> Unsupported [%d/40]", cmd, inSize, gLogged); }
     return kIOReturnUnsupported;
 }
 

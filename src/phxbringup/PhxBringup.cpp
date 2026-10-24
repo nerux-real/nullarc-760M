@@ -370,6 +370,48 @@ void PhxBringup::wreg(uint32_t reg, uint32_t value) const {
     reinterpret_cast<volatile uint32_t *>(mmio->getVirtualAddress())[reg] = value;
 }
 
+
+// The Phoenix / Hawk Point APU comes as the Radeon 780M (12 CUs), 760M (8) and 740M (4) on one PCI id (1002:1900), so the
+// device cannot tell them apart without reading the shader-array harvest registers, which is not safe this early. The
+// CPU's SKU decides the GPU: Ryzen 7040/8040(HS/U) series, tier digit 8/9 -> 780M, 6 -> 760M, 4/5 -> 740M. An SKU not
+// in that pattern gets the plain name rather than a guess.
+static void phxGpuModel(char *out, size_t n) {
+    char brand[49] = {0};
+    for (uint32_t i = 0; i < 3; i++) {
+        uint32_t a = 0x80000002u + i, b, c, d;
+        __asm__ volatile("cpuid" : "+a"(a), "=b"(b), "=c"(c), "=d"(d));
+        memcpy(brand + 16 * i, &a, 4); memcpy(brand + 16 * i + 4, &b, 4);
+        memcpy(brand + 16 * i + 8, &c, 4); memcpy(brand + 16 * i + 12, &d, 4);
+    }
+    const char *name = "AMD Radeon Graphics";
+    // most brand strings already name the GPU ("... w/ Radeon 760M Graphics"): that is the best source
+    static const char *const kKnown[] = {"AMD Radeon 780M", "AMD Radeon 760M", "AMD Radeon 740M"};
+    for (const char *p = brand; *p; p++) {
+        if (!strncmp(p, "Radeon ", 7)) {
+            for (const char *k : kKnown)
+                if (!strncmp(p + 7, k + 11, 4)) { strlcpy(out, k, n); return; }
+            break;
+        }
+    }
+    for (const char *p = brand; *p; p++) {
+        if (p[0] == 'R' && p[1] == 'y' && p[2] == 'z' && p[3] == 'e' && p[4] == 'n') {
+            for (const char *q = p + 5; *q; q++) {
+                if (q[0] >= '0' && q[0] <= '9' && q[1] >= '0' && q[1] <= '9' && q[2] >= '0' && q[2] <= '9' &&
+                    q[3] >= '0' && q[3] <= '9' && !(q[4] >= '0' && q[4] <= '9')) {
+                    if ((q[0] == '7' || q[0] == '8') && q[2] == '4') {
+                        if (q[1] == '8' || q[1] == '9') name = "AMD Radeon 780M";
+                        else if (q[1] == '6') name = "AMD Radeon 760M";
+                        else if (q[1] == '4' || q[1] == '5') name = "AMD Radeon 740M";
+                    }
+                    break;
+                }
+            }
+            break;
+        }
+    }
+    strlcpy(out, name, n);
+}
+
 // FB location (MC, 16 MiB units, FB_BASE bits 23:0) and the system physical address of the carve-out (FB_OFFSET << 24).
 void PhxBringup::readFbLayout() {
     uint32_t base = rreg(PHX_MMMC_VM_FB_LOCATION_BASE) & 0x00FFFFFF;
@@ -382,8 +424,10 @@ void PhxBringup::readFbLayout() {
     setProperty("phx-fb-phys", fbPhys, 64);
     // About This Mac / System Information name the GPU from the PCI device's "model" and size its memory from
     // "VRAM,totalMB"; without them the 780M read "Display, 15 MB" (the boot framebuffer)
-    static const char kModel[] = "AMD Radeon 780M";
-    if (OSData *m = OSData::withBytes(kModel, sizeof(kModel))) {
+    char kModel[40];
+    phxGpuModel(kModel, sizeof kModel);
+    setProperty("phx-gpu-model", kModel);
+    if (OSData *m = OSData::withBytes(kModel, strlen(kModel) + 1)) {
         pci->setProperty("model", m);
         m->release();
     }

@@ -29,7 +29,9 @@ void phxHoldInit(IOService *fb, unsigned bootHoldSec);   // phxagdc.cpp: debug.p
 // experiment switches without a rebuild: `sudo nvram phxfb-x=<n>` (read at start, kept). bit 0: panel reported as external.
 static uint32_t gPhxX = 0;
 static volatile SInt32 gTrace = 0;
-#define PTR(fmt, ...) do { if (OSIncrementAtomic(&gTrace) < 600) IOLog("PhxFB: [t] " fmt "\n", ##__VA_ARGS__); } while (0)
+// the per-call trace is a debugging aid: off unless NVRAM phxfb-x has bit 1 set (nvram phxfb-x=2), it costs kernel log
+// traffic on every WindowServer poll
+#define PTR(fmt, ...) do { if ((gPhxX & 2) && OSIncrementAtomic(&gTrace) < 600) IOLog("PhxFB: [t] " fmt "\n", ##__VA_ARGS__); } while (0)
 
 static int gAlias = 1;
 static bool gAliasSysctl;
