@@ -268,7 +268,9 @@ public:
     IOItemCount getDisplayModeCount() override { return 1; }
     IOReturn getDisplayModes(IODisplayModeID *modes) override { modes[0] = 1; return kIOReturnSuccess; }
     IOReturn getInformationForDisplayMode(IODisplayModeID mode, IODisplayModeInformation *info) override {
-        if (mode != 1 || !info) return kIOReturnBadArgument;
+        // WindowServer failed "obtain mode info" with the single id 1 on 26.7: answer for any id and log which it asked for
+        static int n; if (n++ < 20) PFBLOG("getInformationForDisplayMode(%#x)", (unsigned)mode);
+        if (!info) return kIOReturnBadArgument;
         bzero(info, sizeof(*info));
         info->maxDepthIndex = 0; info->nominalWidth = fWidth; info->nominalHeight = fHeight;
         info->refreshRate = (IOFixed1616)(((uint64_t)fRefreshMilliHz << 16) / 1000); info->flags = kDisplayModeValidFlag | kDisplayModeSafeFlag | kDisplayModeDefaultFlag;
@@ -276,7 +278,8 @@ public:
     }
     UInt64 getPixelFormatsForDisplayMode(IODisplayModeID, IOIndex) override { return 0; }
     IOReturn getPixelInformation(IODisplayModeID mode, IOIndex depth, IOPixelAperture aperture, IOPixelInformation *pi) override {
-        if (mode != 1 || depth != 0 || aperture != kIOFBSystemAperture || !pi) return kIOReturnUnsupportedMode;
+        static int n; if (n++ < 20) PFBLOG("getPixelInformation(mode %#x, depth %d, aperture %d)", (unsigned)mode, (int)depth, (int)aperture);
+        if (aperture != kIOFBSystemAperture || !pi) return kIOReturnUnsupportedMode;
         bzero(pi, sizeof(*pi));
         pi->bytesPerRow = fRowBytes; pi->bitsPerPixel = 32; pi->pixelType = kIORGBDirectPixels;
         pi->componentCount = 3; pi->bitsPerComponent = 8;
@@ -287,9 +290,10 @@ public:
     }
     IOReturn getCurrentDisplayMode(IODisplayModeID *mode, IOIndex *depth) override { *mode = 1; *depth = 0; return kIOReturnSuccess; }
     IOReturn getStartupDisplayMode(IODisplayModeID *mode, IOIndex *depth) override { return getCurrentDisplayMode(mode, depth); }
-    IOReturn setDisplayMode(IODisplayModeID mode, IOIndex depth) override { return (mode == 1 && depth == 0) ? kIOReturnSuccess : kIOReturnUnsupported; }
+    IOReturn setDisplayMode(IODisplayModeID mode, IOIndex depth) override { PFBLOG("setDisplayMode(%#x, %d)", (unsigned)mode, (int)depth); return kIOReturnSuccess; }
     IOReturn getTimingInfoForDisplayMode(IODisplayModeID mode, IOTimingInformation *info) override {
-        if (mode != 1 || !info) return kIOReturnUnsupportedMode;
+        static int n; if (n++ < 20) PFBLOG("getTimingInfoForDisplayMode(%#x)", (unsigned)mode);
+        if (!info) return kIOReturnUnsupportedMode;
         bzero(info, sizeof(*info));
         info->appleTimingID = kIOTimingIDInvalid;   // no detailed timing: the panel keeps the firmware's
         return kIOReturnSuccess;
