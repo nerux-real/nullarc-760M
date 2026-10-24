@@ -1,0 +1,9 @@
+out/gen/MtkBtFirmware.c: BT_RAM_CODE_MT7925_1_1_hdr.bin 448367 bytes sha256 be7c18e37221e277baaef853be3a0ba930138ee879f336ff7b185e79ab09a5c9
+ld: warning: object file (/Applications/Xcode_16.4.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX15.5.sdk/usr/lib/libkmod.a(c_start.o)) was built for newer macOS version (15.5) than being linked (10.15)
+ld: warning: object file (/Applications/Xcode_16.4.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX15.5.sdk/usr/lib/libkmodc++.a(cplus_start.o)) was built for newer macOS version (15.5) than being linked (10.15)
+ld: warning: object file (/Applications/Xcode_16.4.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX15.5.sdk/usr/lib/libkmod.a(c_stop.o)) was built for newer macOS version (15.5) than being linked (10.15)
+ld: warning: object file (/Applications/Xcode_16.4.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX15.5.sdk/usr/lib/libkmodc++.a(cplus_stop.o)) was built for newer macOS version (15.5) than being linked (10.15)
+filetype: MH_KEXT_BUNDLE
+kmod_info: present
+built org.watchthelight.MtkBt 0.2.4: out/MtkBt.kext/Contents/MacOS/MtkBt (494544 bytes)
+sha256: e82d0e6998f4d30093549322491fd9a761cedaca00abd27469887161a38a989e
