@@ -409,10 +409,12 @@ public:
         }
     }
     IOReturn getAttributeForConnection(IOIndex idx, IOSelect attr, uintptr_t *value) override {
-        if (idx != 0 || !value) return kIOReturnBadArgument;
+        if (idx != 0) return kIOReturnBadArgument;
+        // AppleDisplay asks kConnectionSupportsHLDDCSense with a NULL value before it reads the EDID: answer it first
+        if (attr == kConnectionSupportsHLDDCSense) return kIOReturnSuccess;
+        if (!value) return kIOReturnBadArgument;
         switch (attr) {
         case kConnectionEnable: case kConnectionCheckEnable: *value = 1; return kIOReturnSuccess;
-        case kConnectionSupportsHLDDCSense: return kIOReturnSuccess;
         case kConnectionFlags: *value = kIOConnectionBuiltIn; return kIOReturnSuccess;
         case kConnectionColorModesSupported: case kConnectionColorMode: *value = 0x00000001; return kIOReturnSuccess;
         case kConnectionColorDepthsSupported: case kConnectionControllerColorDepth: case kConnectionControllerDepthsSupported:
