@@ -67,6 +67,8 @@ class PhxAMDFB : public IOFramebuffer {
     struct Irq { IOFBInterruptProc proc = nullptr; OSObject *target = nullptr; void *ref = nullptr; };
     Irq fVbl[4], fConnect;   // IOFramebuffer itself and, when it asks, IOAccelDisplayPipe each register a VBL handler
     thread_call_t fVblTimer = nullptr;
+    thread_call_t fConnCall = nullptr;   // tells IOFramebuffer the connection changed, so it probes it (EDID, display connect)
+    volatile int fConnShots = 0;
     uint64_t fVblNext = 0;
     volatile bool fStopping = false;
     bool fBeside = false;   // another framebuffer (the firmware's IONDRV one) already drives this GPU: not the console
@@ -203,6 +205,13 @@ class PhxAMDFB : public IOFramebuffer {
         return kIOReturnUnsupported;
     }
 
+    static void connFire(thread_call_param_t p0, thread_call_param_t) {
+        PhxAMDFB *me = (PhxAMDFB *)p0;
+        if (me->fStopping) return;
+        const IOFBInterruptProc proc = me->fConnect.proc;
+        if (proc) { PFBLOG("connect interrupt -> %s", me->fConnect.target ? me->fConnect.target->getMetaClass()->getClassName() : "?"); proc(me->fConnect.target, me->fConnect.ref); }
+        if (--me->fConnShots > 0 && me->fConnCall) { uint64_t dl; clock_interval_to_deadline(4000, kMillisecondScale, &dl); thread_call_enter_delayed(me->fConnCall, dl); }
+    }
     static void vblFire(thread_call_param_t p0, thread_call_param_t) {
         PhxAMDFB *me = (PhxAMDFB *)p0;
         if (me->fStopping) return;
@@ -349,7 +358,14 @@ public:
             PFBLOG("VBL handler refused: all %u taken", (unsigned)(sizeof fVbl / sizeof fVbl[0]));
             return kIOReturnNoResources;
         }
-        if (type == kIOFBConnectInterruptType) { fConnect = { proc, target, ref }; if (iref) *iref = &fConnect; return kIOReturnSuccess; }
+        if (type == kIOFBConnectInterruptType) {
+            fConnect = { proc, target, ref }; if (iref) *iref = &fConnect;
+            PFBLOG("connect handler registered: %s", target ? target->getMetaClass()->getClassName() : "(none)");
+            // The connection never "changed" for a framebuffer the firmware lit, so IOFramebuffer never probed the panel
+            // (no getDDCBlock call, no display connect, display id 0 in WindowServer): raise it ourselves, twice.
+            if (fConnCall) { fConnShots = 2; uint64_t dl; clock_interval_to_deadline(500, kMillisecondScale, &dl); thread_call_enter_delayed(fConnCall, dl); }
+            return kIOReturnSuccess;
+        }
         return kIOReturnUnsupported;
     }
     IOReturn unregisterInterrupt(void *iref) override {
@@ -578,6 +594,7 @@ bool PhxAMDFB::start(IOService *provider)
     if (fHTotal) { setProperty("PhxFBHTotal", fHTotal, 32); setProperty("PhxFBVTotal", fVTotal, 32); }   // the AGDC's panel timing
     nanoseconds_to_absolutetime(fFrameNs, &gPhxFrameAbs);
     fVblTimer = thread_call_allocate(vblFire, this);
+    fConnCall = thread_call_allocate(connFire, this);
     if (fVblTimer) { uint64_t d; clock_interval_to_deadline((uint32_t)(fFrameNs / 1000), kMicrosecondScale, &d); fVblNext = d; thread_call_enter_delayed(fVblTimer, d); }
     static IOPMPowerState states[2] = {
         { 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 },
@@ -596,6 +613,7 @@ void PhxAMDFB::stop(IOService *provider)
 {
     fStopping = true;
     phxAgdcRemove();
+    if (fConnCall) { thread_call_cancel(fConnCall); while (!thread_call_free(fConnCall)) { thread_call_cancel(fConnCall); IOSleep(5); } fConnCall = nullptr; }
     if (fVblTimer) { thread_call_cancel(fVblTimer); while (!thread_call_free(fVblTimer)) { thread_call_cancel(fVblTimer); IOSleep(5); } fVblTimer = nullptr; }
     if (gAliasSysctl) { for (auto *o : kFbOids) sysctl_unregister_oid(o); gAliasSysctl = false; }
     gPhxFrameAbs = 0;
