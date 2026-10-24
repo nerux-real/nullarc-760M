@@ -44,6 +44,7 @@ jobs:
           git checkout --orphan ci-logs
           git rm -rf --cached . >/dev/null 2>&1 || true
           mkdir -p /tmp/l && cp ./*.log /tmp/l/ 2>/dev/null || true
+          cp -R bt /tmp/l/bt 2>/dev/null || true
           find . -mindepth 1 -maxdepth 1 ! -name .git -exec rm -rf {} +
-          cp /tmp/l/*.log . 2>/dev/null || echo "no logs" > none.txt
+          cp -R /tmp/l/. . 2>/dev/null || echo "no logs" > none.txt
           git add -A && git commit -qm "build logs" && git push -qf origin ci-logs
