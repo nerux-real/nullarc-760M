@@ -298,6 +298,45 @@ public:
         info->appleTimingID = kIOTimingIDInvalid;   // no detailed timing: the panel keeps the firmware's
         return kIOReturnSuccess;
     }
+    // WindowServer ended with display id 0 on 26.7: CoreDisplay names a display from its EDID, and PhxFB published none (the
+    // firmware lit the panel; there is no DDC on an eDP panel). One synthetic 128-byte EDID 1.4 block describes the panel
+    // at the mode PhxFB reports (CVT reduced blanking), vendor LEN, name "Built-in".
+    bool hasDDCConnect(IOIndex idx) override { return idx == 0; }
+    IOReturn getDDCBlock(IOIndex idx, UInt32 bn, IOSelect type, IOOptionBits, UInt8 *data, IOByteCount *len) override {
+        PFBLOG("getDDCBlock(conn %d, block %u, type %u, len %llu)", (int)idx, (unsigned)bn, (unsigned)type, len ? (unsigned long long)*len : 0ull);
+        if (idx != 0 || !data || !len || *len < 128) return kIOReturnBadArgument;
+        if (bn != 1) return kIOReturnNoDevice;   // one block, no extensions
+        uint8_t *e = data; bzero(e, 128);
+        static const uint8_t hdr[8] = { 0, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0 };
+        memcpy(e, hdr, 8);
+        e[8] = 0x30; e[9] = 0xAE;                 // manufacturer "LEN"
+        e[10] = 0x01; e[11] = 0x00;               // product code
+        e[12] = 1;                                // serial
+        e[16] = 1; e[17] = 34;                    // week 1, year 2024
+        e[18] = 1; e[19] = 4;                     // EDID 1.4
+        e[20] = 0xA5;                             // digital, 8 bpc, DisplayPort
+        e[21] = 34; e[22] = 22;                   // 34 x 22 cm (aspect 16:10)
+        e[23] = 0x78; e[24] = 0x0A;               // gamma 2.2, RGB, preferred timing in first descriptor
+        static const uint8_t chroma[10] = { 0xEE, 0x91, 0xA3, 0x54, 0x4C, 0x99, 0x26, 0x0F, 0x50, 0x54 };   // sRGB
+        memcpy(e + 25, chroma, 10);
+        for (int k = 0; k < 8; k++) { e[38 + 2 * k] = 0x01; e[39 + 2 * k] = 0x01; }   // standard timings: unused
+        const uint32_t w = fWidth ? fWidth : 2880, h = fHeight ? fHeight : 1800;
+        const uint32_t hb = 160, vb = 46, mhz = fRefreshMilliHz ? fRefreshMilliHz : 60000;
+        const uint32_t pclk = (uint32_t)((uint64_t)(w + hb) * (h + vb) * mhz / 1000 / 10000);   // 10 kHz units
+        uint8_t *d = e + 54;
+        d[0] = pclk & 0xff; d[1] = (pclk >> 8) & 0xff;
+        d[2] = w & 0xff; d[3] = hb & 0xff; d[4] = (uint8_t)(((w >> 8) << 4) | (hb >> 8));
+        d[5] = h & 0xff; d[6] = vb & 0xff; d[7] = (uint8_t)(((h >> 8) << 4) | (vb >> 8));
+        d[8] = 48; d[9] = 32; d[10] = (3 << 4) | 6; d[11] = 0;
+        d[12] = 0x58; d[13] = 0xD7; d[14] = 0x10;   // 344 x 215 mm
+        d[17] = 0x1A;
+        uint8_t *n = e + 72; n[3] = 0xFC; memcpy(n + 5, "Built-in\n    ", 13);
+        uint8_t *z = e + 90; z[3] = 0x10;
+        uint8_t sum = 0; for (int k = 0; k < 127; k++) sum += e[k];
+        e[127] = (uint8_t)(256 - sum);
+        *len = 128;
+        return kIOReturnSuccess;
+    }
     IOItemCount getConnectionCount() override { return 1; }
     IOReturn registerForInterruptType(IOSelect type, IOFBInterruptProc proc, OSObject *target, void *ref, void **iref) override {
         if (type == kIOFBVBLInterruptType) {
@@ -357,11 +396,16 @@ public:
         if (idx != 0 || !value) return kIOReturnBadArgument;
         switch (attr) {
         case kConnectionEnable: case kConnectionCheckEnable: *value = 1; return kIOReturnSuccess;
+        case kConnectionSupportsHLDDCSense: return kIOReturnSuccess;
         case kConnectionFlags: *value = kIOConnectionBuiltIn; return kIOReturnSuccess;
         case kConnectionColorModesSupported: case kConnectionColorMode: *value = 0x00000001; return kIOReturnSuccess;
         case kConnectionColorDepthsSupported: case kConnectionControllerColorDepth: case kConnectionControllerDepthsSupported:
             *value = 0x00000002; return kIOReturnSuccess;
-        default: return IOFramebuffer::getAttributeForConnection(idx, attr, value);
+        default: {
+            static int n; if (n++ < 40) PFBLOG("getAttributeForConnection(%d, '%c%c%c%c') -> base", (int)idx,
+                (char)(attr >> 24), (char)(attr >> 16), (char)(attr >> 8), (char)attr);
+            return IOFramebuffer::getAttributeForConnection(idx, attr, value);
+        }
         }
     }
     IOReturn connectFlags(IOIndex, IODisplayModeID, IOOptionBits *flags) override {
