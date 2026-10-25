@@ -216,6 +216,55 @@ static void healthyCall(thread_call_param_t, thread_call_param_t) {
     IOLog("PhxPower: %u s of uptime at level %d, marked this boot healthy\n", kHealthySeconds, gLevel);
 }
 
+static thread_call_t gLateCall;
+static constexpr uint32_t kLateSeconds = 20;
+static void lateInit(thread_call_param_t, thread_call_param_t) {
+    uint32_t v;
+    bool present;
+    const bool got = nvramRead("phxpow", &v, &present);
+    IOLog("PhxPower: late init: NVRAM phxpow present=%d value=%u, level was %d\n", present, got ? v : 0, gLevel);
+    if (got) gLevel = (int)(v > 3 ? 3 : v);
+    if (nvramRead("phxpow-epp", &v, &present)) IOLog("PhxPower: NVRAM phxpow-epp=%u is only read at boot, use the boot-arg\n", v);
+    if (gHooked || gLevel < 2) { IOLog("PhxPower: level %d, no idle hook\n", gLevel); return; }
+    if (gLevel >= 2) {
+        uint32_t dv;
+        bool tried;
+        nvramRead("phxpow-trying", &dv, &tried);
+        if (tried) {
+            IOLog("PhxPower: the last boot with level >= 2 never finished (marker phxpow-trying), falling back to level 1 and setting NVRAM phxpow=1\n");
+            nvramDrop("phxpow-trying");
+            nvramPut("phxpow", "1");
+            gLevel = 1;
+        } else {
+            nvramPut("phxpow-trying", "1");
+            gHealthCall = thread_call_allocate(healthyCall, nullptr);
+            if (gHealthCall) {
+                uint64_t dl;
+                clock_interval_to_deadline(kHealthySeconds, NSEC_PER_SEC, &dl);
+                thread_call_enter_delayed(gHealthCall, dl);
+            }
+        }
+    }
+
+    if (gLevel >= 2) {
+        const uint64_t cs = rdmsr64(kMsrCStateBase);
+        const uint32_t base = (uint32_t)cs & 0xffff;
+        IOLog("PhxPower: CStateBaseAddr MSR %llx -> I/O base %x\n", cs, base);
+        if (base == 0 || base > 0xfff0) {
+            IOLog("PhxPower: no usable C-state I/O base, idle stays HLT\n");
+        } else {
+            gPortC2 = (uint16_t)(base + 1);
+            gPortC3 = (uint16_t)(base + 2);
+            gMaxC = gLevel >= 3 ? 3 : 2;
+            gDisp.MachineIdle = phxMachineIdle;
+            pmKextRegister(PM_DISPATCH_VERSION, &gDisp, &gCb);
+            gHooked = true;
+            if (gCb.initComplete) gCb.initComplete();
+            IOLog("PhxPower: idle hook installed, C2 port %x C3 port %x, deepest state C%d\n", gPortC2, gPortC3, gMaxC);
+        }
+    }
+}
+
 // ---- service ------------------------------------------------------------------------------------------------------------
 
 class PhxPower : public IOService {
@@ -242,7 +291,7 @@ bool PhxPower::start(IOService *provider) {
     uint32_t v;
     if (PE_parse_boot_argn("phxpow", &v, sizeof v)) gLevel = (int)(v > 3 ? 3 : v);
     bool present;
-    if (nvramRead("phxpow", &v, &present)) gLevel = (int)(v > 3 ? 3 : v);   // NVRAM wins over the boot-arg
+    if (nvramRead("phxpow", &v, &present)) gLevel = (int)(v > 3 ? 3 : v);   // usually not readable yet; lateInit() asks again
     if (PE_parse_boot_argn("phxpow-epp", &v, sizeof v)) gEpp = v & 0xff;
     if (PE_parse_boot_argn("phxpow-min", &v, sizeof v)) gMinOv = v & 0xff;
     if (PE_parse_boot_argn("phxpow-max", &v, sizeof v)) gMaxOv = v & 0xff;
@@ -283,42 +332,13 @@ bool PhxPower::start(IOService *provider) {
         IOLog("PhxPower: CPPC set on %u CPUs (epp %u)\n", okc, gEpp);
     }
 
-    if (gLevel >= 2) {
-        uint32_t dv;
-        bool tried;
-        nvramRead("phxpow-trying", &dv, &tried);
-        if (tried) {
-            IOLog("PhxPower: the last boot with level >= 2 never finished (marker phxpow-trying), falling back to level 1 and setting NVRAM phxpow=1\n");
-            nvramDrop("phxpow-trying");
-            nvramPut("phxpow", "1");
-            gLevel = 1;
-        } else {
-            nvramPut("phxpow-trying", "1");
-            gHealthCall = thread_call_allocate(healthyCall, nullptr);
-            if (gHealthCall) {
-                uint64_t dl;
-                clock_interval_to_deadline(kHealthySeconds, NSEC_PER_SEC, &dl);
-                thread_call_enter_delayed(gHealthCall, dl);
-            }
-        }
-    }
-
-    if (gLevel >= 2) {
-        const uint64_t cs = rdmsr64(kMsrCStateBase);
-        const uint32_t base = (uint32_t)cs & 0xffff;
-        IOLog("PhxPower: CStateBaseAddr MSR %llx -> I/O base %x\n", cs, base);
-        if (base == 0 || base > 0xfff0) {
-            IOLog("PhxPower: no usable C-state I/O base, idle stays HLT\n");
-        } else {
-            gPortC2 = (uint16_t)(base + 1);
-            gPortC3 = (uint16_t)(base + 2);
-            gMaxC = gLevel >= 3 ? 3 : 2;
-            gDisp.MachineIdle = phxMachineIdle;
-            pmKextRegister(PM_DISPATCH_VERSION, &gDisp, &gCb);
-            gHooked = true;
-            if (gCb.initComplete) gCb.initComplete();
-            IOLog("PhxPower: idle hook installed, C2 port %x C3 port %x, deepest state C%d\n", gPortC2, gPortC3, gMaxC);
-        }
+    // The idle hook is installed later: NVRAM (`phxpow`, the fallback marker) is not readable this early in the boot,
+    // and by then the machine is up, so a hang shows as a missing "healthy" mark rather than a dead boot.
+    gLateCall = thread_call_allocate(lateInit, nullptr);
+    if (gLateCall) {
+        uint64_t dl;
+        clock_interval_to_deadline(kLateSeconds, NSEC_PER_SEC, &dl);
+        thread_call_enter_delayed(gLateCall, dl);
     }
     registerService();
     return true;
