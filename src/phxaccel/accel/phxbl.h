@@ -166,7 +166,7 @@ struct Panel {
             uint8_t e[16]; bzero(e, sizeof e);
             const int ne = auxXfer(m, c, false, kDpEdpRev, e, 4);
             BLLOG("AUX%u: eDP 0x700..703 = %d [%02x %02x %02x %02x]", c, ne, e[0], e[1], e[2], e[3]);
-            if (ne == 4 && e[0] <= 5 && (e[1] || e[2])) {
+            if (ne == 4 && e[0] >= 1 && e[0] <= 0x0f && (e[1] || e[2])) {   // eDP rev: 0 = 1.1 ... 4 = 1.4, 5 = 1.4a, 6 = 1.5 (the 83HW reads 06)
                 pick = (int)c; memcpy(dpcd, e, 4);
                 uint8_t k[8]; bzero(k, sizeof k);
                 const int nk = auxXfer(m, c, false, kDpDispCtl, k, 5);
