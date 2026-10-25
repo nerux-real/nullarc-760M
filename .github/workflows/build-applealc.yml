@@ -42,10 +42,15 @@ jobs:
       - name: Build
         working-directory: AppleALC
         run: xcodebuild -jobs 1 -configuration Release -arch x86_64
+      - name: Build Debug (for -alcdbg logging)
+        working-directory: AppleALC
+        run: xcodebuild -jobs 1 -configuration Debug -arch x86_64
       - name: Package
         run: |
           mkdir -p out
           ditto -c -k --keepParent AppleALC/build/Release/AppleALC.kext out/AppleALC.kext.zip
+          ditto -c -k --keepParent AppleALC/build/Debug/AppleALC.kext out/AppleALC-DEBUG.kext.zip
+          ditto -c -k --keepParent AppleALC/Lilu.kext out/Lilu-DEBUG.kext.zip
           strings AppleALC/build/Release/AppleALC.kext/Contents/MacOS/AppleALC | grep -c SN6140 || true
       - uses: actions/upload-artifact@v6
         with:
