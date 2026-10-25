@@ -1,0 +1,51 @@
+name: Build AppleALC (SN6140)
+
+# AppleALC plus the Conexant SN6140 (14F1:1F87) codec of the Lenovo IdeaPad Slim 5 16AHP10 (83HW), cloned from the CX8070 resources
+# by src/applealc-sn6140/add-codec.py. AppleALC itself is built unmodified otherwise (pinned commit, Lilu from its bootstrap).
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - 'src/applealc-sn6140/**'
+      - '.github/workflows/build-applealc.yml'
+
+env:
+  APPLEALC_REF: ff01db21749271916d44605503499ceaa61d94b2   # AppleALC 1.9.8
+
+jobs:
+  build:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/checkout@v5
+        with:
+          repository: acidanthera/AppleALC
+          ref: ${{ env.APPLEALC_REF }}
+          path: AppleALC
+      - uses: actions/checkout@v5
+        with:
+          repository: acidanthera/MacKernelSDK
+          path: AppleALC/MacKernelSDK
+      - name: CI Bootstrap
+        working-directory: AppleALC
+        run: |
+          src=$(/usr/bin/curl -Lfs https://raw.githubusercontent.com/acidanthera/ocbuild/master/ci-bootstrap.sh) && eval "$src" || exit 1
+      - name: Lilu Bootstrap
+        working-directory: AppleALC
+        run: |
+          src=$(/usr/bin/curl -Lfs https://raw.githubusercontent.com/acidanthera/Lilu/master/Lilu/Scripts/bootstrap.sh) && eval "$src" || exit 1
+      - name: Add the SN6140 codec
+        run: python3 src/applealc-sn6140/add-codec.py AppleALC
+      - name: Build
+        working-directory: AppleALC
+        run: xcodebuild -jobs 1 -configuration Release -arch x86_64
+      - name: Package
+        run: |
+          mkdir -p out
+          ditto -c -k --keepParent AppleALC/build/Release/AppleALC.kext out/AppleALC.kext.zip
+          strings AppleALC/build/Release/AppleALC.kext/Contents/MacOS/AppleALC | grep -c SN6140 || true
+      - uses: actions/upload-artifact@v6
+        with:
+          name: AppleALC-SN6140
+          path: out/AppleALC.kext.zip
