@@ -496,6 +496,18 @@ public:
         default: return IOFramebuffer::setAttributeForConnection(idx, attribute, value);
         }
     }
+    // IOBacklightDisplay / AppleBacklightDisplay only claims a panel whose framebuffer reports kConnectionFlags built-in AND an Apple
+    // sense display type of TFT/LCD (IOGraphics iobl.cpp, probe); the base class answers kIOReturnUnsupported, so the display stayed a
+    // plain AppleDisplay and the slider never reached PhxBacklight (83HW log, 2026-10-25: WindowServer "Set backlight brightness" with
+    // no PhxFB line). IODisplay only uses the sense values when kConnectionSupportsAppleSense is answered, which it is not.
+    IOReturn getAppleSense(IOIndex idx, UInt32 *senseType, UInt32 *primary, UInt32 *extended, UInt32 *displayType) override {
+        if (idx != 0) return kIOReturnBadArgument;
+        if (senseType) *senseType = 0;
+        if (primary) *primary = 0;
+        if (extended) *extended = 0;
+        if (displayType) *displayType = 2;   // kPanelTFTConnect
+        return kIOReturnSuccess;
+    }
     IOReturn getAttributeForConnection(IOIndex idx, IOSelect attr, uintptr_t *value) override {
         PTR("getAttributeForConnection(%d, '%c%c%c%c')", (int)idx, (char)(attr >> 24), (char)(attr >> 16), (char)(attr >> 8), (char)attr);
         if (idx != 0) return kIOReturnBadArgument;
