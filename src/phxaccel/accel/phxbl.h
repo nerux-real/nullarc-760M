@@ -184,11 +184,42 @@ struct Panel {
               ch, dpcd[2], ctl[1], two ? "16-bit" : "8-bit", pwm, pwmPeriod, level, kLevels);
     }
 
+    // display sleep: macOS dims nothing itself, the framebuffer has to turn the backlight off (measured on the 83HW: the
+    // panel kept drawing the same power with the display "asleep", 2026-10-25). Level is remembered and restored.
+    bool blanked = false;
+    void blank(bool off) {
+        if (!lock) return;
+        if (!off) {
+            IOLockLock(lock);
+            const bool was = blanked;
+            blanked = false;
+            const uint32_t lv = level;
+            IOLockUnlock(lock);
+            if (was) { BLLOG("display awake: restoring level %u", lv); set(lv ? lv : kLevels / 2); }
+            return;
+        }
+        IOLockLock(lock);
+        if (!blanked) {
+            blanked = true;
+            if (mode == Pwm && pwm >= 0) {
+                const uint32_t o = pwm ? kPwm1 : kPwm0, cn = m.rd(o);
+                m.wr(o, cn & ~0x7FFFFu);
+                BLLOG("display asleep: PWM duty 0 (BL_PWM_CNTL %08x -> %08x)", cn, m.rd(o));
+            } else if (mode == Dpcd && ch >= 0) {
+                uint8_t v[2] = { 0, 0 };
+                const int n = auxXfer(m, (uint32_t)ch, true, kDpBlMsb, v, two ? 2 : 1);
+                BLLOG("display asleep: DPCD brightness 0 -> %d", n);
+            }
+        }
+        IOLockUnlock(lock);
+    }
+
     // level 0..kLevels
     bool set(uint32_t lvl) {
         if (!lock) return false;
         if (lvl > kLevels) lvl = kLevels;
         IOLockLock(lock);
+        if (blanked) { level = lvl; IOLockUnlock(lock); return true; }   // applied when the display wakes
         bool ok = false;
         const uint32_t hw = curve(lvl, hwMax);
         if (mode == Dpcd && ch >= 0) {

@@ -338,6 +338,7 @@ class PhxAMDFB : public IOFramebuffer {
 
 public:
     bool blSet(uint32_t level) { return fBlMap ? fBl.set(level) : false; }
+    void blPower(bool on) { if (fBlMap && !(gPhxX & 16)) fBl.blank(!on); }   // phxfb-x bit 16: leave the backlight alone
     uint32_t blLevel() const { return fBl.level; }
     static constexpr uint32_t kBlLevels = phxbl::Panel::kLevels;
     bool start(IOService *provider) override;
@@ -462,16 +463,19 @@ public:
     // power and connection answers as NullMoth's NMIntelFB/NVRMFB give them: acknowledge at once, never queue on the
     // controller thread (a base-class power change waited 45 s for an acknowledge and froze WindowServer restarts)
     IOReturn setPowerState(unsigned long ordinal, IOService *) override {
+        if (ordinal) blPower(true);
         handleEvent(ordinal ? kIOFBNotifyDidPowerOn : kIOFBNotifyWillPowerOff);
+        if (!ordinal) blPower(false);
         return kIOPMAckImplied;
     }
     IOReturn setAttribute(IOSelect attribute, uintptr_t value) override {
         PTR("setAttribute('%c%c%c%c', %#lx)", (char)(attribute >> 24), (char)(attribute >> 16), (char)(attribute >> 8), (char)attribute, (unsigned long)value);
         if (attribute == kIOWindowServerActiveAttribute) return kIOReturnSuccess;
         if (attribute == kIOPowerAttribute) {
-            if (value) { IOReturn r = IOFramebuffer::setAttribute(attribute, value); handleEvent(kIOFBNotifyDidPowerOn);
+            if (value) { blPower(true); IOReturn r = IOFramebuffer::setAttribute(attribute, value); handleEvent(kIOFBNotifyDidPowerOn);
                          return r == kIOReturnUnsupported ? kIOReturnSuccess : r; }
             handleEvent(kIOFBNotifyWillPowerOff);
+            blPower(false);
             IOReturn r = IOFramebuffer::setAttribute(attribute, value);
             return r == kIOReturnUnsupported ? kIOReturnSuccess : r;
         }
