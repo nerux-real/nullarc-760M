@@ -13,11 +13,14 @@ jobs:
         run: sh src/phxaccel/build.sh "$RUNNER_TEMP/MacKernelSDK"
       - name: Build PhxBringup
         run: sh src/phxbringup/build.sh "$RUNNER_TEMP/MacKernelSDK"
+      - name: Build PhxPower
+        run: sh src/phxpower/build.sh "$RUNNER_TEMP/MacKernelSDK"
       - name: Package
         run: |
           mkdir out
           ditto -c -k --keepParent src/phxaccel/build/PhxAccel.kext out/PhxAccel.kext.zip
           ditto -c -k --keepParent src/phxbringup/build/PhxBringup.kext out/PhxBringup.kext.zip
+          ditto -c -k --keepParent src/phxpower/build/PhxPower.kext out/PhxPower.kext.zip
       - uses: actions/upload-artifact@v4
         with:
           name: kexts
