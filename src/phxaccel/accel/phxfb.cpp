@@ -18,6 +18,7 @@
 #include <IOKit/IOSubMemoryDescriptor.h>
 #include <libkern/OSAtomic.h>
 #include <sys/sysctl.h>
+#include "phxbl.h"
 #include "nvrm_vram_abi.h"
 #include "nvrm_gpuva_abi.h"
 
@@ -267,7 +268,7 @@ class PhxAMDFB : public IOFramebuffer {
         return *ns ? (uint32_t)(((uint64_t)*frames * 1000000000000ull) / *ns) : 0;
     }
     void dumpOtg(volatile uint32_t *r, const char *why) {
-        for (uint32_t i = 0x1b2a; i < 0x1b78; i += 6)
+        for (uint32_t i = 0x1b2a; i < 0x1b92; i += 6)
             PFBLOG("OTG0 %s [%#x..]: %08x %08x %08x %08x %08x %08x", why, i, r[kOtg + i], r[kOtg + i + 1], r[kOtg + i + 2],
                    r[kOtg + i + 3], r[kOtg + i + 4], r[kOtg + i + 5]);
     }
@@ -325,7 +326,20 @@ class PhxAMDFB : public IOFramebuffer {
         PFBLOG("refresh: OTG0 %ux%u totals, %u frames in %llu us -> %u.%03u Hz", ht, vt, frames, ns / 1000, mhz / 1000, mhz % 1000);
     }
 
+    // backlight (phxbl.h): probed at start, driven by PhxBacklight (an IODisplayParameterHandler under this framebuffer)
+    IOMemoryMap *fBlMap = nullptr;
+    phxbl::Panel fBl;
+    IOService *fBlHandler = nullptr;
+    void blInit() {
+        fBlMap = fPCI ? fPCI->mapDeviceMemoryWithRegister(kIOPCIConfigBaseAddress5) : nullptr;
+        if (!fBlMap || fBlMap->getLength() < 0x19200u) { BLLOG("no usable MMIO view: no backlight"); OSSafeReleaseNULL(fBlMap); return; }
+        fBl.probe((volatile uint32_t *)fBlMap->getVirtualAddress(), (uint32_t)fBlMap->getLength());
+    }
+
 public:
+    bool blSet(uint32_t level) { return fBlMap ? fBl.set(level) : false; }
+    uint32_t blLevel() const { return fBl.level; }
+    static constexpr uint32_t kBlLevels = phxbl::Panel::kLevels;
     bool start(IOService *provider) override;
     void stop(IOService *provider) override;
     IOReturn enableController() override { return kIOReturnSuccess; }
@@ -345,6 +359,11 @@ public:
         bzero(info, sizeof(*info));
         info->maxDepthIndex = 0; info->nominalWidth = fWidth; info->nominalHeight = fHeight;
         info->refreshRate = (IOFixed1616)(((uint64_t)fRefreshMilliHz << 16) / 1000); info->flags = kDisplayModeValidFlag | kDisplayModeSafeFlag | kDisplayModeDefaultFlag;
+        // 2026-10-25: the mode the panel runs is its native, built-in, accelerated one and may be used for HiDPI; a framebuffer
+        // that does not say so gets no scaled ("looks like") modes from CoreDisplay however the display override lists them.
+        // `nvram phxfb-x=4` brings the old flags back.
+        if (!(gPhxX & 4)) info->flags |= kDisplayModeNativeFlag | kDisplayModeBuiltInFlag | kDisplayModeValidForHiResFlag |
+                                         kDisplayModeAcceleratorBackedFlag | kDisplayModeValidForMirroringFlag;
         return kIOReturnSuccess;
     }
     UInt64 getPixelFormatsForDisplayMode(IODisplayModeID, IOIndex) override { return 0; }
@@ -562,6 +581,44 @@ public:
 
 OSDefineMetaClassAndStructors(PhxAMDFB, IOFramebuffer)
 
+// The display's "brightness" parameter. IODisplay (AppleDisplay / AppleBacklightDisplay) searches the framebuffer's subtree
+// for IODisplayParameterHandlers: this one adds the parameter and applies what System Settings / the brightness keys set.
+class PhxBacklight : public IODisplayParameterHandler {
+    OSDeclareDefaultStructors(PhxBacklight)
+public:
+    PhxAMDFB *fFb = nullptr;
+    IODisplay *fDisplay = nullptr;
+    unsigned fLogged = 0;
+    bool setDisplay(IODisplay *d) override { fDisplay = d; BLLOG("setDisplay(%s)", d ? d->getName() : "none"); return d != nullptr; }
+    bool doDataSet(const OSSymbol *, OSData *) override { return false; }
+    bool doIntegerSet(OSDictionary *, const OSSymbol *name, UInt32 value) override {
+        if (!fFb || !name) return false;
+        if (fLogged < 24) { fLogged++; BLLOG("doIntegerSet(%s, %u)", name->getCStringNoCopy(), (unsigned)value); }
+        if (strcmp(name->getCStringNoCopy(), kIODisplayBrightnessKey) != 0) return false;
+        fFb->blSet(value);
+        return true;
+    }
+    bool doUpdate() override {
+        if (!fFb || !fDisplay) return true;
+        OSObject *po = fDisplay->copyProperty(kIODisplayParametersKey);
+        OSDictionary *d = OSDynamicCast(OSDictionary, po);
+        OSDictionary *mine = nullptr;
+        if (!d) { mine = OSDictionary::withCapacity(4); d = mine; }
+        if (d) {
+            if (const OSSymbol *k = OSSymbol::withCString(kIODisplayBrightnessKey)) {
+                if (!d->getObject(k)) IODisplay::addParameter(d, k, 0, (SInt32)PhxAMDFB::kBlLevels);
+                IODisplay::setParameter(d, k, (SInt32)fFb->blLevel());
+                k->release();
+            }
+            if (mine) { fDisplay->setProperty(kIODisplayParametersKey, mine); mine->release(); }
+        }
+        OSSafeReleaseNULL(po);
+        if (fLogged < 24) { fLogged++; BLLOG("doUpdate: brightness 0..%u at %u", (unsigned)PhxAMDFB::kBlLevels, (unsigned)fFb->blLevel()); }
+        return true;
+    }
+};
+OSDefineMetaClassAndStructors(PhxBacklight, IODisplayParameterHandler)
+
 // One boot per arming: `nvram <name>=1` lets the next start use the feature, and start removes the variable and
 // commits NVRAM at once, so a boot that panics (or shows a black panel) after this point comes back without hands.
 static bool takeOneShot(const char *name)
@@ -680,6 +737,13 @@ bool PhxAMDFB::start(IOService *provider)
     setProperty("built-in", kOSBooleanTrue);
     setProperty("PhxFBWidth", fWidth, 32); setProperty("PhxFBHeight", fHeight, 32);   // the AGDC's panel timing reads these
     measureRefresh();
+    if (!(gPhxX & 8)) {   // `nvram phxfb-x=8`: no backlight handler
+        blInit();
+        if (PhxBacklight *h = new PhxBacklight) {
+            if (h->init()) { h->fFb = this; if (h->attach(this)) fBlHandler = h; else h->release(); } else h->release();
+        }
+        BLLOG("%s", fBlHandler ? "brightness handler attached" : "brightness handler NOT attached");
+    }
     setProperty("PhxFBRefreshMilliHz", fRefreshMilliHz, 32);
     if (fHTotal) { setProperty("PhxFBHTotal", fHTotal, 32); setProperty("PhxFBVTotal", fVTotal, 32); }   // the AGDC's panel timing
     nanoseconds_to_absolutetime(fFrameNs, &gPhxFrameAbs);
@@ -702,6 +766,8 @@ bool PhxAMDFB::start(IOService *provider)
 void PhxAMDFB::stop(IOService *provider)
 {
     fStopping = true;
+    if (fBlHandler) { PhxBacklight *h = (PhxBacklight *)fBlHandler; h->fFb = nullptr; h->detach(this); h->release(); fBlHandler = nullptr; }
+    OSSafeReleaseNULL(fBlMap);
     phxAgdcRemove();
     if (fConnCall) { thread_call_cancel(fConnCall); while (!thread_call_free(fConnCall)) { thread_call_cancel(fConnCall); IOSleep(5); } fConnCall = nullptr; }
     if (fVblTimer) { thread_call_cancel(fVblTimer); while (!thread_call_free(fVblTimer)) { thread_call_cancel(fVblTimer); IOSleep(5); } fVblTimer = nullptr; }
