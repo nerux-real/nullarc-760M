@@ -23,6 +23,32 @@
 
 ---
 
+## This fork
+
+**Fork of [luuumi-dev/nullarc](https://github.com/luuumi-dev/nullarc)**, ported to a machine the upstream project never ran on:
+Lenovo IdeaPad Slim 5 16AHP10 (83HW), Ryzen 5 8645HS, **Radeon 760M** (Phoenix, PCI 1002:1900 rev C6, 8 CU), internal 2880×1800
+OLED panel (EDID `LEN8BAD`), macOS Tahoe 26.7.1 (25G241), booted with OpenCore. Everything below the upstream commit `cbb08dd`
+(2026-10-21) is this fork's work. The upstream README, architecture and licences are unchanged.
+
+What is different from upstream:
+
+| Area | Change | Status on 83HW |
+|---|---|---|
+| **GPU identity** | `PhxBringup` names the GPU from the CPU SKU (760M / 740M / 780M) instead of always "780M". | working |
+| **Display on macOS 26.7** | `PhxFB` publishes a synthetic EDID, raises the connect interrupt so `IOFramebuffer` probes the panel, answers `kConnectionSupportsHLDDCSense` with a NULL value and any mode id, so WindowServer gets a real display instead of display id 0; `PhxAGDC` answers the 26.7 commands (`0x925`, `0x941`, `0x2001`, …). | working: WindowServer composites on the GPU |
+| **Permissions** | `install.sh` makes the Metal plugin readable by WindowServer (`chmod -R go-w,a+rX` on `PhxGPU`). Re-running the installer used to reset it to root-only and acceleration silently disappeared. | working |
+| **Logging** | `PhxFB` / `PhxAGDC` are quiet by default; `nvram phxfb-x=2` turns the per-call trace back on (`phxdebug=1` only gates PhxBringup's debug selectors). | working |
+| **Refresh rate (experimental)** | `PhxFB` dumps OTG0's timing registers at start. On this panel the firmware lights 60 Hz by stretching the vertical front porch at the 120 Hz line rate (3080 × 3840, ~710 MHz; EDID range 30–120 Hz). `sudo nvram phxfb-120=1` (one boot per arming, removed at start) halves `V_TOTAL` to 1920 when the blanking registers agree, and keeps it only if the frame counter then shows ~120 Hz. | **untested** |
+| **Build** | `.github/workflows/build-kexts.yml` builds `PhxAccel.kext` and `PhxBringup.kext` on a macOS runner and uploads them (`kexts` artifact). | working |
+| **Bluetooth (extra)** | [`extras/mtkbt`](extras/mtkbt) (MediaTek MT7925 USB Bluetooth, from [watchthelight-labs](https://labs.watchthelight.org/mt7925-hackintosh-bluetooth/)) and [`extras/legionbtfix`](extras/legionbtfix) with `.github/workflows/build-bt.yml`. Not part of the GPU driver. | MtkBt hung before the USB fix below; being retried |
+
+Not done yet on this fork: backlight / brightness control, HiDPI scaled modes in `PhxFB` (macOS lists only 2880×1800;
+a display-override plist works around it), external displays, hardware video decode.
+
+Notes from the same machine that are not in this repo but matter for a working Hackintosh with it: `XHCILagFix`
+([hbyonly1](https://github.com/hbyonly1/xhcilagfix), Lilu plugin) fixes the very slow USB-A/USB-C ports on AMD xHCI,
+and an `SSDT` that sets `\_SB.PCI0.LPC0.EC0.ECAV` to 1 brings back the battery and AC state.
+
 ## Status
 
 Measured on the reference machine — Firebat U6C, Ryzen 7 H 255, Radeon 780M, 2560×1600 120 Hz eDP, macOS Tahoe 26.6.2 —

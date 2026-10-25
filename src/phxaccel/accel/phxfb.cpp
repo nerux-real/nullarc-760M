@@ -266,17 +266,20 @@ class PhxAMDFB : public IOFramebuffer {
         return *ns ? (uint32_t)(((uint64_t)*frames * 1000000000000ull) / *ns) : 0;
     }
     void dumpOtg(volatile uint32_t *r, const char *why) {
-        for (uint32_t i = 0x1b2a; i < 0x1b60; i += 6)
+        for (uint32_t i = 0x1b2a; i < 0x1b78; i += 6)
             PFBLOG("OTG0 %s [%#x..]: %08x %08x %08x %08x %08x %08x", why, i, r[kOtg + i], r[kOtg + i + 1], r[kOtg + i + 2],
                    r[kOtg + i + 3], r[kOtg + i + 4], r[kOtg + i + 5]);
     }
     void tryHighRefresh(volatile uint32_t *r, uint32_t mhz) {
         const uint32_t ht = r[kOtg + 0x1b2a] + 1, vt = r[kOtg + 0x1b2f] + 1;
-        const uint32_t vbse = r[kOtg + 0x1b35], bs = vbse & 0x7fff, be = (vbse >> 16) & 0x7fff;   // active = [bs, be)
+        // measured on 83HW: V_BLANK_START_END (0x1b36) = 0x00280730: blank starts at line 1840 (BLANK_START, bits 14:0) and ends
+        // at line 40 (bits 30:16), so the active lines are [40, 1840) = 1800, V_SYNC_A (0x1b37) 0..16, V_TOTAL 3840: the
+        // front porch (1840..3840) is what the firmware stretched for 60 Hz. Halving V_TOTAL only trims that porch.
+        const uint32_t vbse = r[kOtg + 0x1b36], bs = vbse & 0x7fff, be = (vbse >> 16) & 0x7fff;
         if (mhz < 55000 || mhz > 65000) { PFBLOG("120 Hz: panel is at %u mHz, not the 60 Hz this expects: leaving it", mhz); return; }
         const uint32_t nvt = (uint32_t)(((uint64_t)vt * mhz + 60000) / 120000);   // 3840 -> 1920
         if (ht < 2000 || ht > 4500 || vt < 3000 || vt > 4500) { PFBLOG("120 Hz: totals %ux%u are not what this expects: leaving it", ht, vt); return; }
-        if (be <= bs || be - bs != fHeight || be + 8 > nvt) {
+        if (bs <= be || bs - be != fHeight || bs + 8 > nvt) {
             PFBLOG("120 Hz: blank start/end %u/%u do not fit %u active lines in %u total: leaving it", bs, be, (unsigned)fHeight, nvt); return;
         }
         const uint32_t oldv = r[kOtg + 0x1b2f];
