@@ -59,6 +59,8 @@ static struct sysctl_oid *const kFbOids[] = { &sysctl__debug_phxfb_alias, &sysct
 // The class name carries "AMD": CoreDisplay tells the GPU vendor from the framebuffer's class name (Intel, AMD, NVDA,
 // AppleParavirt), and for any other name it turns IOPresentment off, which left the panel on the software compositor
 // with the Metal compositor up for the accelerator (GetGPUVendorForFramebufferService -> 1, 2026-10-20).
+static bool takeOneShot(const char *name);   // below: NVRAM one-shot switches
+
 class PhxAMDFB : public IOFramebuffer {
     OSDeclareDefaultStructors(PhxAMDFB)
     IOPCIDevice *fPCI = nullptr;
@@ -248,19 +250,65 @@ class PhxAMDFB : public IOFramebuffer {
     // the panel scanned at 120 (OTG frame counter: 392 frames in 3.28 s), and WindowServer composited at 60 fps (2026-10-20).
     // Read-only: OTG0's H/V totals (DCN 3.1.4: segment 2 base 0x34c0 + 0x1b2a / 0x1b2f) and its frame counter (+0x1b4c)
     // over ~200 ms, snapped to a standard rate when within 2 %.
+    //
+    // 2026-10-25, 83HW (Lenovo 16" 2880x1800 OLED, EDID LEN8BAD): the firmware lights it at 60 Hz with the line rate of
+    // its 120 Hz mode (3080 total x 3840 total at ~710 MHz; EDID range limits 30-120 Hz, 230 kHz line rate): the panel
+    // stretches the vertical front porch to lower the refresh. 120 Hz is then the same pixel clock and the same lines
+    // with V_TOTAL halved (3840 -> 1920). `nvram phxfb-120=1` (one boot per arming) does that, only when the OTG's
+    // blanking registers agree with that reading, and keeps it only if the frame counter then shows ~120 Hz.
+    static constexpr uint32_t kOtg = 0x34c0;
+    uint32_t sampleRefresh(volatile uint32_t *r, uint32_t *frames, uint64_t *ns) {
+        const uint32_t c0 = r[kOtg + 0x1b4c] & 0xffffff; const uint64_t t0 = mach_absolute_time();
+        IOSleep(200);
+        const uint32_t c1 = r[kOtg + 0x1b4c] & 0xffffff; const uint64_t t1 = mach_absolute_time();
+        absolutetime_to_nanoseconds(t1 - t0, ns);
+        *frames = (c1 - c0) & 0xffffff;
+        return *ns ? (uint32_t)(((uint64_t)*frames * 1000000000000ull) / *ns) : 0;
+    }
+    void dumpOtg(volatile uint32_t *r, const char *why) {
+        for (uint32_t i = 0x1b2a; i < 0x1b60; i += 6)
+            PFBLOG("OTG0 %s [%#x..]: %08x %08x %08x %08x %08x %08x", why, i, r[kOtg + i], r[kOtg + i + 1], r[kOtg + i + 2],
+                   r[kOtg + i + 3], r[kOtg + i + 4], r[kOtg + i + 5]);
+    }
+    void tryHighRefresh(volatile uint32_t *r, uint32_t mhz) {
+        const uint32_t ht = r[kOtg + 0x1b2a] + 1, vt = r[kOtg + 0x1b2f] + 1;
+        const uint32_t vbse = r[kOtg + 0x1b35], bs = vbse & 0x7fff, be = (vbse >> 16) & 0x7fff;   // active = [bs, be)
+        if (mhz < 55000 || mhz > 65000) { PFBLOG("120 Hz: panel is at %u mHz, not the 60 Hz this expects: leaving it", mhz); return; }
+        const uint32_t nvt = (uint32_t)(((uint64_t)vt * mhz + 60000) / 120000);   // 3840 -> 1920
+        if (ht < 2000 || ht > 4500 || vt < 3000 || vt > 4500) { PFBLOG("120 Hz: totals %ux%u are not what this expects: leaving it", ht, vt); return; }
+        if (be <= bs || be - bs != fHeight || be + 8 > nvt) {
+            PFBLOG("120 Hz: blank start/end %u/%u do not fit %u active lines in %u total: leaving it", bs, be, (unsigned)fHeight, nvt); return;
+        }
+        const uint32_t oldv = r[kOtg + 0x1b2f];
+        // write just after a frame boundary, so the new total lands in the blanking, not in the active lines
+        const uint32_t f0 = r[kOtg + 0x1b4c] & 0xffffff;
+        for (int k = 0; k < 4000000 && (r[kOtg + 0x1b4c] & 0xffffff) == f0; k++) { }
+        r[kOtg + 0x1b2f] = nvt - 1;
+        IOSleep(150);
+        uint32_t frames; uint64_t ns; const uint32_t m2 = sampleRefresh(r, &frames, &ns);
+        PFBLOG("120 Hz: V_TOTAL %u -> %u, now %u.%03u Hz (%u frames in %llu us), V_TOTAL reads back %u", vt, nvt, m2 / 1000, m2 % 1000,
+               frames, ns / 1000, r[kOtg + 0x1b2f] + 1);
+        if (m2 < 110000 || m2 > 130000) {
+            r[kOtg + 0x1b2f] = oldv; IOSleep(100);
+            PFBLOG("120 Hz: no effect or out of range: V_TOTAL put back to %u", r[kOtg + 0x1b2f] + 1);
+        }
+        dumpOtg(r, "after");
+    }
     void measureRefresh() {
         IOMemoryMap *mm = fPCI ? fPCI->mapDeviceMemoryWithRegister(kIOPCIConfigBaseAddress5) : nullptr;
         if (!mm || mm->getLength() < 0x5100u * 4) { OSSafeReleaseNULL(mm); PFBLOG("refresh: no MMIO view, 60 Hz assumed"); return; }
         volatile uint32_t *r = (volatile uint32_t *)mm->getVirtualAddress();
-        const uint32_t ctl = r[0x34c0 + 0x1b41], ht = r[0x34c0 + 0x1b2a] + 1, vt = r[0x34c0 + 0x1b2f] + 1;
-        const uint32_t c0 = r[0x34c0 + 0x1b4c] & 0xffffff; const uint64_t t0 = mach_absolute_time();
-        IOSleep(200);
-        const uint32_t c1 = r[0x34c0 + 0x1b4c] & 0xffffff; const uint64_t t1 = mach_absolute_time();
+        dumpOtg(r, "boot");
+        uint32_t frames; uint64_t ns;
+        uint32_t mhz = sampleRefresh(r, &frames, &ns);
+        const bool want120 = takeOneShot("phxfb-120");
+        if (want120 && (r[kOtg + 0x1b41] & 1) && frames >= 4) {
+            tryHighRefresh(r, mhz);
+            mhz = sampleRefresh(r, &frames, &ns);
+        }
+        const uint32_t ctl = r[kOtg + 0x1b41], ht = r[kOtg + 0x1b2a] + 1, vt = r[kOtg + 0x1b2f] + 1;
         mm->release();
-        uint64_t ns; absolutetime_to_nanoseconds(t1 - t0, &ns);
-        const uint32_t frames = (c1 - c0) & 0xffffff;
         if (!(ctl & 1) || !ns || frames < 4 || ht < 100 || vt < 100) { PFBLOG("refresh: OTG0 not running (ctl 0x%x, %u frames), 60 Hz assumed", ctl, frames); return; }
-        uint32_t mhz = (uint32_t)(((uint64_t)frames * 1000000000000ull) / ns);
         static const uint32_t kStd[] = { 48000, 50000, 60000, 75000, 90000, 100000, 120000, 144000, 165000, 240000 };
         for (uint32_t k : kStd) if (mhz > k * 49 / 50 && mhz < k * 51 / 50) { mhz = k; break; }
         if (mhz < 24000 || mhz > 360000) { PFBLOG("refresh: %u mHz measured, out of range - 60 Hz assumed", mhz); return; }
@@ -506,29 +554,30 @@ public:
 
 OSDefineMetaClassAndStructors(PhxAMDFB, IOFramebuffer)
 
-// One boot per arming: `nvram phxfb-boot=1` lets the next start take the panel, and start removes the variable and
-// commits NVRAM at once, so a boot that panics after this point comes back on the firmware framebuffer without hands.
-static bool takeBootArming()
+// One boot per arming: `nvram <name>=1` lets the next start use the feature, and start removes the variable and
+// commits NVRAM at once, so a boot that panics (or shows a black panel) after this point comes back without hands.
+static bool takeOneShot(const char *name)
 {
     IORegistryEntry *opts = IORegistryEntry::fromPath("/options", gIODTPlane);
     if (!opts) return false;
-    OSObject *o = opts->copyProperty("phxfb-boot");
+    OSObject *o = opts->copyProperty(name);
     const bool armed = o != nullptr;
     bool stuck = false;
     OSSafeReleaseNULL(o);
     if (armed) {
-        opts->removeProperty("phxfb-boot");
+        opts->removeProperty(name);
         // the forced commit: the throttled one (IONVRAM-SYNCNOW) left the variable in flash once, and the boot after a
         // panic took the panel again (2026-10-20)
         if (OSString *why = OSString::withCString("phxfb")) { opts->setProperty("IONVRAM-FORCESYNCNOW-PROPERTY", why); why->release(); }
-        o = opts->copyProperty("phxfb-boot");
+        o = opts->copyProperty(name);
         stuck = o != nullptr;
-        PFBLOG("NVRAM phxfb-boot taken (%s)", stuck ? "STILL SET: removal refused, not taking the panel" : "removed and committed");
+        PFBLOG("NVRAM %s taken (%s)", name, stuck ? "STILL SET: removal refused, ignoring it" : "removed and committed");
         OSSafeReleaseNULL(o);
     }
     opts->release();
     return armed && !stuck;
 }
+static bool takeBootArming() { return takeOneShot("phxfb-boot"); }
 
 static void readExperimentSwitch()
 {
