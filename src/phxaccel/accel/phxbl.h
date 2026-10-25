@@ -71,15 +71,15 @@ static int auxXfer(const Mmio &m, uint32_t ch, bool write, uint32_t addr, uint8_
             const uint32_t cnt = (st >> 24) & 0x1F;
             if (!cnt) ret = -5;
             else {
-                m.wr(b + DAT, m.rd(b + DAT) & ~0x1F0000u);                 // INDEX = 0
-                m.wr(b + DAT, m.rd(b + DAT) | 0x80000000u);                // autoincrement disabled
-                m.wr(b + DAT, m.rd(b + DAT) | 1u);                         // read side
-                const uint32_t reply = (m.rd(b + DAT) >> 8) & 0xFF;        // reply command in the high nibble: 0 = ACK
+                // read side, one byte at a time with an explicit index and no autoincrement: a stuck pointer returned the reply
+                // byte for every position on the first try (all zeros, 2026-10-25), so the pointer is never left to the hardware
+                auto rdAt = [&](uint32_t k) -> uint32_t { m.wr(b + DAT, 1u | (k << 16) | 0x80000000u); return (m.rd(b + DAT) >> 8) & 0xFF; };
+                const uint32_t reply = rdAt(0);                            // reply command in the high nibble: 0 = ACK
                 if ((reply >> 4) != 0) ret = -6;
                 else if (write) ret = (int)len;
                 else {
                     const uint32_t n = cnt - 1 < len ? cnt - 1 : len;
-                    for (uint32_t i = 0; i < n; i++) buf[i] = (uint8_t)((m.rd(b + DAT) >> 8) & 0xFF);
+                    for (uint32_t i = 0; i < n; i++) buf[i] = (uint8_t)rdAt(1 + i);
                     ret = (int)n;
                 }
             }
@@ -100,7 +100,8 @@ struct Panel {
     bool needMode = false;          // panel not in DPCD mode: switch it on the first set
     uint8_t dpcd[0x10];             // 0x700..0x70f
     uint8_t ctl[8];                 // 0x720..0x727
-    uint32_t pwmPeriod = 0;
+    uint32_t pwmPeriod = 0;         // full-scale duty value (period << fractional bits)
+    uint32_t pwmFrac = 0;
     uint32_t hwMax = 0xFFFF;        // largest hardware value (DPCD 16-bit, or PWM period)
     uint32_t level = 0;             // last level set, 0..kLevels
     static constexpr uint32_t kLevels = 1024;
@@ -136,7 +137,10 @@ struct Panel {
             if (!m.ok(o + 3) || !m.ok(ps + 1)) continue;
             const uint32_t cn = m.rd(o), c2 = m.rd(o + 1), pe = m.rd(o + 2), lk = m.rd(o + 3), pc = m.rd(ps), pst = m.rd(ps + 1);
             BLLOG("PWRSEQ%d: BL_PWM_CNTL %08x CNTL2 %08x PERIOD %08x LOCK %08x | PANEL_PWRSEQ_CNTL %08x STATE %08x", p, cn, c2, pe, lk, pc, pst);
-            if ((cn & 0x80000000u) && (pe & 0xFFFF) && !(cn & 0x40000000u) && pwm < 0) { pwm = p; pwmPeriod = pe & 0xFFFF; }
+            // 83HW: BL_PWM_CNTL c000fa00, PERIOD 000c0fa0: enabled, fractional, period 4000 with a 12-bit integer part, so the duty
+            // register holds the duty left-aligned to 16 bits (4000 << 4 = 0xfa00 = 100 %)
+            const uint32_t period = pe & 0xFFFF, bitcnt = (pe >> 16) & 0x1F, fracBits = (cn & 0x40000000u) && bitcnt && bitcnt < 16 ? 16 - bitcnt : 0;
+            if ((cn & 0x80000000u) && period && pwm < 0) { pwm = p; pwmPeriod = period << fracBits; pwmFrac = fracBits; }
         }
         // AUX channels that are enabled: who answers, and is it an eDP sink with a backlight
         int pick = -1;
@@ -173,9 +177,9 @@ struct Panel {
         } else if (mode == Pwm) {
             hwMax = pwmPeriod;
             const uint32_t o = pwm ? kPwm1 : kPwm0;
-            level = uncurve(m.rd(o) & 0xFFFF, hwMax);
+            level = uncurve(m.rd(o) & 0x7FFFF, hwMax);
         } else level = kLevels;
-        BLLOG("backlight: %s (AUX%d, adj cap %02x, mode reg %02x, %s, PWM%d period %u) initial level %u/%u",
+        BLLOG("backlight: %s (AUX%d, adj cap %02x, mode reg %02x, %s, PWM%d full scale %u) initial level %u/%u",
               mode == Dpcd ? (needMode ? "DPCD (panel not in DPCD mode yet)" : "DPCD") : mode == Pwm ? "PWM" : "NONE: slider will do nothing",
               ch, dpcd[2], ctl[1], two ? "16-bit" : "8-bit", pwm, pwmPeriod, level, kLevels);
     }
@@ -202,7 +206,7 @@ struct Panel {
         } else if (mode == Pwm && pwm >= 0) {
             const uint32_t o = pwm ? kPwm1 : kPwm0;
             const uint32_t cn = m.rd(o);
-            m.wr(o, (cn & ~0xFFFFu) | (hw & 0xFFFF));
+            m.wr(o, (cn & ~0x7FFFFu) | (hw & 0x7FFFF));
             ok = true;
             if (setCount < 8) BLLOG("set level %u -> PWM duty %u of %u (BL_PWM_CNTL %08x -> %08x)", lvl, hw, pwmPeriod, cn, m.rd(o));
         } else if (setCount < 8) BLLOG("set level %u: no backlight path", lvl);
