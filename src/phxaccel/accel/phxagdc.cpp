@@ -77,6 +77,17 @@ IOReturn PhxDeviceControl::vendor_doDeviceAttribute(unsigned int cmd, unsigned l
                                                     unsigned long *out, unsigned long *outSize, IOExternalMethodArguments *)
 {
     OSAddAtomic64(1, &gCmds);
+    {   // backlight hunt (2026-10-25): every distinct vendor command once, whatever the log budget below is
+        static unsigned seen[64]; static int ns = 0;
+        bool known = false;
+        for (int i = 0; i < ns && !known; i++) known = seen[i] == cmd;
+        if (!known && ns < 64) {
+            seen[ns++] = cmd;
+            const uint32_t *w = (const uint32_t *)in;
+            AGLOG("first cmd %#x in=%lu out=%lu w0=%#x w1=%#x", cmd, inSize, outSize ? *outSize : 0ul,
+                  (in && inSize >= 4) ? w[0] : 0, (in && inSize >= 8) ? w[1] : 0);
+        }
+    }
     if (cmd == 1) {
         if (!out || !outSize || *outSize != sizeof(PhxAGDCVendorInfo)) return kIOReturnBadArgument;
         PhxAGDCVendorInfo *v = (PhxAGDCVendorInfo *)out;

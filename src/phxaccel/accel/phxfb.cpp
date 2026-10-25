@@ -63,6 +63,7 @@ static struct sysctl_oid *const kFbOids[] = { &sysctl__debug_phxfb_alias, &sysct
 static bool takeOneShot(const char *name);   // below: NVRAM one-shot switches
 static bool nvramHas(const char *name);
 
+static void seenAttr(const char *kind, uint32_t idx, uint32_t attr, uintptr_t value);
 class PhxAMDFB : public IOFramebuffer {
     OSDeclareDefaultStructors(PhxAMDFB)
     IOPCIDevice *fPCI = nullptr;
@@ -469,6 +470,7 @@ public:
         return kIOPMAckImplied;
     }
     IOReturn setAttribute(IOSelect attribute, uintptr_t value) override {
+        seenAttr("setAttribute", 0, attribute, value);
         PTR("setAttribute('%c%c%c%c', %#lx)", (char)(attribute >> 24), (char)(attribute >> 16), (char)(attribute >> 8), (char)attribute, (unsigned long)value);
         if (attribute == kIOWindowServerActiveAttribute) return kIOReturnSuccess;
         if (attribute == kIOPowerAttribute) {
@@ -482,11 +484,13 @@ public:
         return IOFramebuffer::setAttribute(attribute, value);
     }
     IOReturn getAttribute(IOSelect attribute, uintptr_t *value) override {
+        seenAttr("getAttribute", 0, attribute, 0);
         PTR("getAttribute('%c%c%c%c')", (char)(attribute >> 24), (char)(attribute >> 16), (char)(attribute >> 8), (char)attribute);
         if (attribute == kIOWindowServerActiveAttribute) { if (value) *value = 1; return kIOReturnSuccess; }
         return IOFramebuffer::getAttribute(attribute, value);
     }
     IOReturn setAttributeForConnection(IOIndex idx, IOSelect attribute, uintptr_t value) override {
+        seenAttr("setAttributeForConnection", (uint32_t)idx, attribute, value);
         PTR("setAttributeForConnection(%d, '%c%c%c%c', %#lx)", (int)idx, (char)(attribute >> 24), (char)(attribute >> 16), (char)(attribute >> 8), (char)attribute, (unsigned long)value);
         switch (attribute) {
         case kConnectionPower: case kConnectionColorModesSupported: case kConnectionColorDepthsSupported:
@@ -509,6 +513,7 @@ public:
         return kIOReturnSuccess;
     }
     IOReturn getAttributeForConnection(IOIndex idx, IOSelect attr, uintptr_t *value) override {
+        seenAttr("getAttributeForConnection", (uint32_t)idx, attr, 0);
         PTR("getAttributeForConnection(%d, '%c%c%c%c')", (int)idx, (char)(attr >> 24), (char)(attr >> 16), (char)(attr >> 8), (char)attr);
         if (idx != 0) return kIOReturnBadArgument;
         // AppleDisplay asks kConnectionSupportsHLDDCSense with a NULL value before it reads the EDID: answer it first
@@ -599,6 +604,17 @@ OSDefineMetaClassAndStructors(PhxAMDFB, IOFramebuffer)
 
 // The display's "brightness" parameter. IODisplay (AppleDisplay / AppleBacklightDisplay) searches the framebuffer's subtree
 // for IODisplayParameterHandlers: this one adds the parameter and applies what System Settings / the brightness keys set.
+// log each distinct framebuffer attribute selector the first time it is seen (backlight hunt, 2026-10-25): which selector does the
+// brightness slider use, if not the IODisplay parameter handler
+static void seenAttr(const char *kind, uint32_t idx, uint32_t attr, uintptr_t value)
+{
+    static uint32_t seen[96]; static int n = 0;
+    for (int i = 0; i < n; i++) if (seen[i] == (attr ^ (idx << 28) ^ (kind[0] << 24))) return;
+    if (n >= 96) return;
+    seen[n++] = attr ^ (idx << 28) ^ (kind[0] << 24);
+    auto pc = [](uint32_t c) { return (c >= 32 && c < 127) ? (char)c : '.'; };
+    BLLOG("first %s(%u, '%c%c%c%c' %#x, %#lx)", kind, idx, pc(attr >> 24), pc((attr >> 16) & 255), pc((attr >> 8) & 255), pc(attr & 255), attr, (unsigned long)value);
+}
 class PhxBacklight : public IODisplayParameterHandler {
     OSDeclareDefaultStructors(PhxBacklight)
 public:
@@ -606,10 +622,10 @@ public:
     IODisplay *fDisplay = nullptr;
     unsigned fLogged = 0;
     bool setDisplay(IODisplay *d) override { fDisplay = d; BLLOG("setDisplay(%s)", d ? d->getName() : "none"); return d != nullptr; }
-    bool doDataSet(const OSSymbol *, OSData *) override { return false; }
+    bool doDataSet(const OSSymbol *n, OSData *) override { if (fLogged < 400) { fLogged++; BLLOG("doDataSet(%s)", n ? n->getCStringNoCopy() : "?"); } return false; }
     bool doIntegerSet(OSDictionary *, const OSSymbol *name, UInt32 value) override {
         if (!fFb || !name) return false;
-        if (fLogged < 24) { fLogged++; BLLOG("doIntegerSet(%s, %u)", name->getCStringNoCopy(), (unsigned)value); }
+        if (fLogged < 400) { fLogged++; BLLOG("doIntegerSet(%s, %u)", name->getCStringNoCopy(), (unsigned)value); }
         if (strcmp(name->getCStringNoCopy(), kIODisplayBrightnessKey) != 0) return false;
         fFb->blSet(value);
         return true;
@@ -629,7 +645,7 @@ public:
             if (mine) { fDisplay->setProperty(kIODisplayParametersKey, mine); mine->release(); }
         }
         OSSafeReleaseNULL(po);
-        if (fLogged < 24) { fLogged++; BLLOG("doUpdate: brightness 0..%u at %u", (unsigned)PhxAMDFB::kBlLevels, (unsigned)fFb->blLevel()); }
+        if (fLogged < 400) { fLogged++; BLLOG("doUpdate: brightness 0..%u at %u", (unsigned)PhxAMDFB::kBlLevels, (unsigned)fFb->blLevel()); }
         return true;
     }
 };

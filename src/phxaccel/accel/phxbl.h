@@ -265,7 +265,7 @@ struct Panel {
                 oledOn = c == 1 && e == 1;
                 BLLOG("OLED backlight on: control %d enable %d", c, e);
             }
-            if (setCount < 8 || !ok) BLLOG("set level %u -> OLED %u millinits (of %u): %d", lvl, hw, hwMax, n);
+            if (setCount < 300 || !ok) BLLOG("set level %u -> OLED %u millinits (of %u): %d", lvl, hw, hwMax, n);
         } else if (mode == Dpcd && ch >= 0) {
             if (needMode) {
                 uint8_t mb = (uint8_t)((ctl[1] & ~3u) | 2u), en = (uint8_t)(ctl[0] | 1u);
@@ -277,13 +277,13 @@ struct Panel {
             uint8_t v[2] = { (uint8_t)(two ? hw >> 8 : hw), (uint8_t)hw };
             const int n = auxXfer(m, (uint32_t)ch, true, kDpBlMsb, v, two ? 2 : 1);
             ok = n == (two ? 2 : 1);
-            if (setCount < 8 || !ok) BLLOG("set level %u -> DPCD %s%02x%02x: %d", lvl, two ? "" : "(8-bit) ", v[0], v[1], n);
+            if (setCount < 300 || !ok) BLLOG("set level %u -> DPCD %s%02x%02x: %d", lvl, two ? "" : "(8-bit) ", v[0], v[1], n);
         } else if (mode == Pwm && pwm >= 0) {
             const uint32_t o = pwm ? kPwm1 : kPwm0;
             const uint32_t cn = m.rd(o);
             m.wr(o, (cn & ~0x7FFFFu) | (hw & 0x7FFFF));
             ok = true;
-            if (setCount < 8) BLLOG("set level %u -> PWM duty %u of %u (BL_PWM_CNTL %08x -> %08x)", lvl, hw, pwmPeriod, cn, m.rd(o));
+            if (setCount < 300) BLLOG("set level %u -> PWM duty %u of %u (BL_PWM_CNTL %08x -> %08x)", lvl, hw, pwmPeriod, cn, m.rd(o));
         } else if (setCount < 8) BLLOG("set level %u: no backlight path", lvl);
         setCount++;
         if (ok) level = lvl;
