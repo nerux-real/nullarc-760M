@@ -60,6 +60,7 @@ static struct sysctl_oid *const kFbOids[] = { &sysctl__debug_phxfb_alias, &sysct
 // AppleParavirt), and for any other name it turns IOPresentment off, which left the panel on the software compositor
 // with the Metal compositor up for the accelerator (GetGPUVendorForFramebufferService -> 1, 2026-10-20).
 static bool takeOneShot(const char *name);   // below: NVRAM one-shot switches
+static bool nvramHas(const char *name);
 
 class PhxAMDFB : public IOFramebuffer {
     OSDeclareDefaultStructors(PhxAMDFB)
@@ -304,7 +305,11 @@ class PhxAMDFB : public IOFramebuffer {
         dumpOtg(r, "boot");
         uint32_t frames; uint64_t ns;
         uint32_t mhz = sampleRefresh(r, &frames, &ns);
-        const bool want120 = takeOneShot("phxfb-120");
+        // on by default since 2026-10-25 (83HW: 119.6 Hz measured, looks smoother). Off with the boot-arg -phxfb60 or
+        // `sudo nvram phxfb-60=1`; the old one-shot `phxfb-120` is still consumed so a leftover does not linger.
+        char a60[8]; takeOneShot("phxfb-120");
+        const bool want120 = !PE_parse_boot_argn("-phxfb60", a60, sizeof a60) && !nvramHas("phxfb-60");
+        if (!want120) PFBLOG("120 Hz: disabled (-phxfb60 / NVRAM phxfb-60): staying on the firmware's refresh");
         if (want120 && (r[kOtg + 0x1b41] & 1) && frames >= 4) {
             tryHighRefresh(r, mhz);
             mhz = sampleRefresh(r, &frames, &ns);
@@ -579,6 +584,15 @@ static bool takeOneShot(const char *name)
     }
     opts->release();
     return armed && !stuck;
+}
+static bool nvramHas(const char *name)
+{
+    IORegistryEntry *opts = IORegistryEntry::fromPath("/options", gIODTPlane);
+    if (!opts) return false;
+    OSObject *o = opts->copyProperty(name);
+    const bool has = o != nullptr;
+    OSSafeReleaseNULL(o); opts->release();
+    return has;
 }
 static bool takeBootArming() { return takeOneShot("phxfb-boot"); }
 
