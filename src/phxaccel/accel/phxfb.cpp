@@ -277,7 +277,7 @@ class PhxAMDFB : public IOFramebuffer {
         // front porch (1840..3840) is what the firmware stretched for 60 Hz. Halving V_TOTAL only trims that porch.
         const uint32_t vbse = r[kOtg + 0x1b36], bs = vbse & 0x7fff, be = (vbse >> 16) & 0x7fff;
         if (mhz < 55000 || mhz > 65000) { PFBLOG("120 Hz: panel is at %u mHz, not the 60 Hz this expects: leaving it", mhz); return; }
-        const uint32_t nvt = (uint32_t)(((uint64_t)vt * mhz + 60000) / 120000);   // 3840 -> 1920
+        const uint32_t nvt = (vt + 1) / 2;   // 3840 -> 1920 (exactly half: 120.06 Hz at this line rate; from the measured 59.7 it came out 1911, 119.6 Hz)
         if (ht < 2000 || ht > 4500 || vt < 3000 || vt > 4500) { PFBLOG("120 Hz: totals %ux%u are not what this expects: leaving it", ht, vt); return; }
         if (bs <= be || bs - be != fHeight || bs + 8 > nvt) {
             PFBLOG("120 Hz: blank start/end %u/%u do not fit %u active lines in %u total: leaving it", bs, be, (unsigned)fHeight, nvt); return;
