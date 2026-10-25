@@ -32,11 +32,12 @@ What is different from upstream:
 | **Permissions** | `install.sh` makes the Metal plugin readable by WindowServer (`chmod -R go-w,a+rX` on `PhxGPU`). Re-running the installer used to reset it to root-only and acceleration silently disappeared. | working |
 | **Logging** | `PhxFB` / `PhxAGDC` are quiet by default; `nvram phxfb-x=2` turns the per-call trace back on (`phxdebug=1` only gates PhxBringup's debug selectors). | working |
 | **Refresh rate (experimental)** | `PhxFB` dumps OTG0's timing registers at start. On this panel the firmware lights 60 Hz by stretching the vertical front porch at the 120 Hz line rate (3080 × 3840, ~710 MHz; EDID range 30–120 Hz). Done at every start (opt out with boot-arg `-phxfb60` or `sudo nvram phxfb-60=1`): halves `V_TOTAL` to 1920 when the blanking registers agree, and keeps it only if the frame counter then shows ~120 Hz. | **works on 83HW**: frame counter 119.6 Hz after the switch (macOS then renders at 120 Hz); smoothness still being checked |
+| **Brightness (experimental)** | `PhxFB` probes the eDP panel's backlight at start (`phxbl.h`): DPCD brightness over the AUX channel (eDP 1.4, the usual OLED way) or the display engine's PWM, whichever the panel is already using, and attaches an `IODisplayParameterHandler` so the display gets a `brightness` parameter. The probe and every set are logged (`PhxFB: BL:`). | **untested** |
+| **HiDPI modes (experimental)** | The one display mode now carries the native / built-in / valid-for-HiRes / accelerator-backed flags CoreDisplay wants before it offers scaled ("looks like") modes. `nvram phxfb-x=4` restores the old flags, `phxfb-x=8` skips the backlight handler. | **untested** |
 | **Build** | `.github/workflows/build-kexts.yml` builds `PhxAccel.kext` and `PhxBringup.kext` on a macOS runner and uploads them (`kexts` artifact). | working |
 | **Bluetooth (extra)** | [`extras/mtkbt`](extras/mtkbt) (MediaTek MT7925 USB Bluetooth, from [watchthelight-labs](https://labs.watchthelight.org/mt7925-hackintosh-bluetooth/)) and [`extras/legionbtfix`](extras/legionbtfix) with `.github/workflows/build-bt.yml`. Not part of the GPU driver. | MtkBt hung before the USB fix below; being retried |
 
-Not done yet on this fork: backlight / brightness control, HiDPI scaled modes in `PhxFB` (macOS lists only 2880×1800;
-a display-override plist works around it), external displays, hardware video decode.
+Not done yet on this fork: external displays (HDMI, USB-C), hardware video decode.
 
 Notes from the same machine that are not in this repo but matter for a working Hackintosh with it: `XHCILagFix`
 ([hbyonly1](https://github.com/hbyonly1/xhcilagfix), Lilu plugin) fixes the very slow USB-A/USB-C ports on AMD xHCI,
