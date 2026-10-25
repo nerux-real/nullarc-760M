@@ -12,6 +12,8 @@ on:
 
 env:
   APPLEALC_REF: ff01db21749271916d44605503499ceaa61d94b2   # AppleALC 1.9.8
+  PROJECT_TYPE: KEXT
+  JOB_TYPE: BUILD
 
 jobs:
   build:
