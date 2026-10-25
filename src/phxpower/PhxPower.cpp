@@ -36,7 +36,9 @@
 #include <sys/sysctl.h>
 #include <mach/mach_time.h>
 #include <i386/proc_reg.h>
-#include <i386/pmCPU.h>
+extern "C" {
+#include <i386/pmCPU.h>   // MacKernelSDK has no C++ guards: without extern "C" pmKextRegister is mangled and OpenCore cannot resolve it
+}
 #include <kern/thread_call.h>
 #include <kern/clock.h>
 
