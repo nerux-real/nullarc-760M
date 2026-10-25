@@ -55,4 +55,4 @@ jobs:
       - uses: actions/upload-artifact@v6
         with:
           name: AppleALC-SN6140
-          path: out/AppleALC.kext.zip
+          path: out/*.zip
