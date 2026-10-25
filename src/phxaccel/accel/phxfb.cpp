@@ -668,7 +668,7 @@ static void readExperimentSwitch()
     else if (OSNumber *nn = OSDynamicCast(OSNumber, o)) snprintf(buf, sizeof buf, "%u", nn->unsigned32BitValue());
     OSSafeReleaseNULL(o); opts->release();
     uint32_t v = 0; for (const char *c = buf; *c >= '0' && *c <= '9'; c++) v = v * 10 + (uint32_t)(*c - '0');
-    gPhxX = v; PFBLOG("experiment switch phxfb-x = %u", v);
+    gPhxX = v; phxbl::gPhxBlNoOled = (v & 32) != 0; PFBLOG("experiment switch phxfb-x = %u", v);
 }
 
 bool PhxAMDFB::start(IOService *provider)

@@ -5,6 +5,10 @@
 //   - DPCD over the AUX channel (eDP 1.4 "backlight adjustment by AUX": brightness at DPCD 0x722/0x723, control mode in
 //     0x721, enable in 0x720). The usual way for OLED panels, which have no PWM pin. The transaction sequence is the one
 //     of amdgpu's dce_aux.c on the DP_AUX block of DCN 3.1.4 (register offsets from dcn_3_1_4_offset.h).
+//   - AMD's "source backlight" AUX protocol for OLED panels (DPCD 0x320 level in millinits + transition time, 0x32E control,
+//     0x32F enable; sink-capability bit 0x317[4] = OLED). An OLED has no PWM pin, so the PWM registers can look alive and
+//     change nothing (83HW: BL_PWM_CNTL c000fa00 stays at 0xfa00 in Linux at every brightness; only 0x320 moves). This is
+//     what amdgpu does (link_edp_panel_control.c, BACKLIGHT_CONTROL_AMD_AUX) and what the 83HW reads: 0x317 = 97.
 //   - the display engine's own PWM (PWRSEQ0/1 BL_PWM_*), when the panel is a PWM-pin one.
 // The ACPI side (DSDT LCD._BCM -> ATIF function 7 "set backlight level") only tells the GPU driver the level; the driver
 // has to apply it, so nothing in the firmware does it for us.
@@ -20,6 +24,8 @@
 
 namespace phxbl {
 
+static bool gPhxBlNoOled = false;   // phxfb-x bit 32: ignore the OLED path (fall back to PWM/DPCD detection)
+
 static constexpr uint32_t kDcn = 0x34c0;                              // DCN segment 2 base (dwords) in BAR5
 static constexpr uint32_t kAuxBase = 0x1f50, kAuxStride = 0x1c, kAuxChannels = 5;
 static constexpr uint32_t kPwm0 = 0x2f19, kPwm1 = 0x2f85;              // PWRSEQn_BL_PWM_CNTL (+1 CNTL2, +2 PERIOD_CNTL, +3 GRP1_REG_LOCK)
@@ -27,6 +33,7 @@ static constexpr uint32_t kPwrSeq0 = 0x2f14, kPwrSeq1 = 0x2f80;        // PWRSEQ
 
 // eDP DPCD
 static constexpr uint32_t kDpEdpRev = 0x700, kDpEdpCap1 = 0x701, kDpEdpAdjCap = 0x702;
+static constexpr uint32_t kDpSinkExt = 0x317, kDpSrcLevel = 0x320, kDpSrcControl = 0x32E, kDpSrcEnable = 0x32F;
 static constexpr uint32_t kDpDispCtl = 0x720, kDpBlMode = 0x721, kDpBlMsb = 0x722, kDpBlLsb = 0x723, kDpPwmBits = 0x724;
 
 struct Mmio {
@@ -90,7 +97,7 @@ static int auxXfer(const Mmio &m, uint32_t ch, bool write, uint32_t addr, uint8_
 }
 
 struct Panel {
-    enum Mode { None = 0, Dpcd = 1, Pwm = 2 };
+    enum Mode { None = 0, Dpcd = 1, Pwm = 2, Oled = 3 };
     Mmio m;
     IOLock *lock = nullptr;
     Mode mode = None;
@@ -106,6 +113,10 @@ struct Panel {
     uint32_t level = 0;             // last level set, 0..kLevels
     static constexpr uint32_t kLevels = 1024;
     uint32_t setCount = 0;
+    // OLED (AMD source-backlight AUX) state
+    uint32_t oledMax = 441757;      // millinits at full brightness (what Linux writes at 100 % on the 83HW: 0x6bd9d)
+    uint32_t oledMs = 30;           // transition time sent with each level
+    bool oledOn = false;            // 0x32E/0x32F written since the last blank
 
     // user level -> hardware value: perceptual (gamma 2.2) curve over 0.3 %..100 % of the hardware range, so the lowest
     // step is dim but never black (an OLED at 0 looks like a dead screen)
@@ -164,13 +175,24 @@ struct Panel {
             }
         }
         ch = pick;
+        uint8_t ext = 0; uint32_t srcLevel = 0;
+        if (ch >= 0) {
+            uint8_t b[4] = { 0, 0, 0, 0 };
+            if (auxXfer(m, (uint32_t)ch, false, kDpSinkExt, &ext, 1) != 1) ext = 0;
+            if (auxXfer(m, (uint32_t)ch, false, kDpSrcLevel, b, 4) == 4) srcLevel = b[0] | b[1] << 8 | b[2] << 16 | (uint32_t)b[3] << 24;
+            BLLOG("AUX%d: sink ext caps 0x317 = %02x (sdr-aux %u, oled %u), source level 0x320 = %u millinits", ch, ext, ext & 1, (ext >> 4) & 1, srcLevel);
+        }
         two = ch >= 0 && (dpcd[2] & 0x04);
         const bool auxCap = ch >= 0 && (dpcd[2] & 0x02);
         const uint32_t dmode = ctl[1] & 3;
-        if (auxCap && dmode == 2) mode = Dpcd;                            // already brightness-by-DPCD: the usual OLED case
+        if (ch >= 0 && (ext & 1) && (ext & 0x10) && !gPhxBlNoOled) mode = Oled;   // OLED: AUX only, whatever the PWM block says
+        else if (auxCap && dmode == 2) mode = Dpcd;                            // already brightness-by-DPCD: the usual OLED case
         else if (pwm >= 0)        mode = Pwm;
         else if (auxCap)          { mode = Dpcd; needMode = true; }       // no PWM to fall back on: put the panel into DPCD mode
-        if (mode == Dpcd) {
+        if (mode == Oled) {
+            hwMax = oledMax;
+            level = (srcLevel >= oledMax / 400 && srcLevel <= oledMax + oledMax / 8) ? uncurve(srcLevel > oledMax ? oledMax : srcLevel, hwMax) : kLevels;
+        } else if (mode == Dpcd) {
             hwMax = two ? 0xFFFF : 0xFF;
             const uint32_t cur = two ? ((uint32_t)ctl[2] << 8 | ctl[3]) : ctl[2];
             level = needMode ? kLevels : uncurve(cur, hwMax);
@@ -180,7 +202,7 @@ struct Panel {
             level = uncurve(m.rd(o) & 0x7FFFF, hwMax);
         } else level = kLevels;
         BLLOG("backlight: %s (AUX%d, adj cap %02x, mode reg %02x, %s, PWM%d full scale %u) initial level %u/%u",
-              mode == Dpcd ? (needMode ? "DPCD (panel not in DPCD mode yet)" : "DPCD") : mode == Pwm ? "PWM" : "NONE: slider will do nothing",
+               mode == Oled ? "OLED (AMD source-backlight AUX)" : mode == Dpcd ? (needMode ? "DPCD (panel not in DPCD mode yet)" : "DPCD") : mode == Pwm ? "PWM" : "NONE: slider will do nothing",
               ch, dpcd[2], ctl[1], two ? "16-bit" : "8-bit", pwm, pwmPeriod, level, kLevels);
     }
 
@@ -201,7 +223,12 @@ struct Panel {
         IOLockLock(lock);
         if (!blanked) {
             blanked = true;
-            if (mode == Pwm && pwm >= 0) {
+            if (mode == Oled && ch >= 0) {
+                uint8_t z = 0;
+                const int n = auxXfer(m, (uint32_t)ch, true, kDpSrcEnable, &z, 1);
+                oledOn = false;
+                BLLOG("display asleep: OLED backlight enable 0 -> %d", n);
+            } else if (mode == Pwm && pwm >= 0) {
                 const uint32_t o = pwm ? kPwm1 : kPwm0, cn = m.rd(o);
                 m.wr(o, cn & ~0x7FFFFu);
                 BLLOG("display asleep: PWM duty 0 (BL_PWM_CNTL %08x -> %08x)", cn, m.rd(o));
@@ -222,7 +249,24 @@ struct Panel {
         if (blanked) { level = lvl; IOLockUnlock(lock); return true; }   // applied when the display wakes
         bool ok = false;
         const uint32_t hw = curve(lvl, hwMax);
-        if (mode == Dpcd && ch >= 0) {
+        if (mode == Oled && ch >= 0) {
+            // as amdgpu: luminance-control (VESA) off in 0x721, level+transition at 0x320, source control 0x32E=1, enable 0x32F=1
+            if (ctl[1] & 0x80) {
+                uint8_t mb = (uint8_t)(ctl[1] & ~0x80u);
+                if (auxXfer(m, (uint32_t)ch, true, kDpBlMode, &mb, 1) == 1) ctl[1] = mb;
+            }
+            uint8_t v[6] = { (uint8_t)hw, (uint8_t)(hw >> 8), (uint8_t)(hw >> 16), (uint8_t)(hw >> 24), (uint8_t)oledMs, (uint8_t)(oledMs >> 8) };
+            const int n = auxXfer(m, (uint32_t)ch, true, kDpSrcLevel, v, 6);
+            ok = n == 6;
+            if (ok && !oledOn) {
+                uint8_t one = 1;
+                const int c = auxXfer(m, (uint32_t)ch, true, kDpSrcControl, &one, 1);
+                const int e = auxXfer(m, (uint32_t)ch, true, kDpSrcEnable, &one, 1);
+                oledOn = c == 1 && e == 1;
+                BLLOG("OLED backlight on: control %d enable %d", c, e);
+            }
+            if (setCount < 8 || !ok) BLLOG("set level %u -> OLED %u millinits (of %u): %d", lvl, hw, hwMax, n);
+        } else if (mode == Dpcd && ch >= 0) {
             if (needMode) {
                 uint8_t mb = (uint8_t)((ctl[1] & ~3u) | 2u), en = (uint8_t)(ctl[0] | 1u);
                 const int a = auxXfer(m, (uint32_t)ch, true, kDpBlMode, &mb, 1);
