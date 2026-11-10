@@ -262,6 +262,12 @@ static long nvmtl_sysconf(int name)
     long page = getpagesize();
     return page > 0 ? (long)(hi.max_mem / (uint64_t)page) : v;
 }
+// WindowServer runs with real uid root and effective uid _windowserver. Mesa takes that for a setuid program and turns
+// its shader disk cache off (__normal_user()), so every boot compiled every WindowServer pipeline again; on battery in
+// Low Power Mode one compile held the main thread past the 40 s watchdog (10-22). The driver's getuid/getgid answer
+// the effective ids, which own the cache directory.
+static uid_t nvmtl_icd_getuid(void) { return geteuid(); }
+static gid_t nvmtl_icd_getgid(void) { return getegid(); }
 // Point one imported symbol of the image that holds `inside` at `repl` (its lazy and non-lazy pointers). Returns how
 // many pointers were changed. The driver's own dylib only: nothing else in the process is touched.
 static int nvmtl_rebind_import(const void *inside, const char *symbol, void *repl)
@@ -712,6 +718,12 @@ static int nvmtl_vk_initialize(void)
             nvlog("vk: driver opened directly: %s (image %s)", NVMTL_ICD_LIB, nvmtl_image_ident((const void *)pvkGetInstanceProcAddr, vid, sizeof vid));
             { int rb = nvmtl_rebind_import((const void *)pvkGetInstanceProcAddr, "_sysconf", (void *)nvmtl_sysconf);
               if (rb <= 0) nvlog("vk: memory-size fallback missing: _sysconf not rebound in %s (%d) -- sandboxed apps may have no device", NVMTL_ICD_LIB, rb); }
+            if ((getuid() != geteuid() || getgid() != getegid()) && !getenv("NVMTL_NO_MESA_CACHE_DIR")) {
+                const int ru = nvmtl_rebind_import((const void *)pvkGetInstanceProcAddr, "_getuid", (void *)nvmtl_icd_getuid);
+                const int rg = nvmtl_rebind_import((const void *)pvkGetInstanceProcAddr, "_getgid", (void *)nvmtl_icd_getgid);
+                nvlog("vk: %s runs as uid %d over %d: the driver sees the effective ids, so its shader disk cache stays on (%d+%d pointers)",
+                      getprogname(), (int)geteuid(), (int)getuid(), ru, rg);
+            }
             if (nvmtl_vk_vendor() == 0x10de) { int rb = nvmtl_rebind_import((const void *)pvkGetInstanceProcAddr, "_open", (void *)nvmtl_icd_open);
               if (rb <= 0) nvlog("vk: owned handle fallback missing: _open not rebound in %s (%d)", NVMTL_ICD_LIB, rb); }
             pnvk_stage_import = (void (*)(const nvmtl_vram_rec *))dlsym(g_lib, "nvmtl_nvk_stage_import");
@@ -1124,6 +1136,7 @@ static int memtype(uint32_t bits, VkMemoryPropertyFlags want)
 }
 
 #define NVMTL_POOL_BLOCK (32u << 20)
+#define NVMTL_POOL_FIRST (4u << 20)   // a process's first pool block; each next one doubles the pool, up to the block cap
 #define NVMTL_POOL_MAX   (4u << 20)
 #define NVMTL_POOL_KEEP  2
 static size_t g_bar1_bytes; static int g_bar1_off;
@@ -1931,11 +1944,26 @@ int nvmtl_vk_surface_dirty(uint32_t surfaceID, uint32_t plane) { return nvmtl_vk
 /* the same mark, given up instead of waiting when the accelerator lock is taken (NVRM_SS_PLANE_TRYLOCK; only an NVAccel
    that publishes NVAccelSurfaceWait is asked): 0 marked, 1 the lock was taken, -1 refused */
 int nvmtl_vk_surface_dirty_try(uint32_t surfaceID, uint32_t plane) { return nvmtl_vk_surface_mark_newest(surfaceID, plane, 0x40000000u); }
-// WindowServer completion mark (NVAccel nvSurfGpuEscape), on NVK's surface escape: 0 = the kernel took it
+// Without NVK the mark goes through PhxBringup (PHXN_SEL_SURF_GPU_MARK, build 34), which hands it to PhxAccel's
+// accelerator; an older kext refuses the selector and WindowServer keeps waiting for its composites itself.
+static io_connect_t g_phx_mark_conn;
+static pthread_once_t g_phx_mark_once = PTHREAD_ONCE_INIT;
+static void nvmtl_phx_mark_open(void)
+{
+    io_service_t s = IOServiceGetMatchingService(kIOMainPortDefault, IOServiceMatching("PhxBringup"));
+    if (!s) return;
+    if (IOServiceOpen(s, mach_task_self(), 0x4E34384Eu, &g_phx_mark_conn) != KERN_SUCCESS) g_phx_mark_conn = 0;
+    IOObjectRelease(s);
+}
+// WindowServer completion mark (NVAccel nvSurfGpuEscape), on NVK's surface escape or PhxBringup's: 0 = the kernel took it
 uint32_t nvmtl_vk_surface_gpu_mark(uint32_t surfaceID, int pending)
 {
-    if (!pnvk_surface_dirty || !g_dev) return 0x80000002u;
-    return pnvk_surface_dirty(g_dev, surfaceID, 0x80000000u | (pending ? 1u : 0u));
+    if (pnvk_surface_dirty && g_dev) return pnvk_surface_dirty(g_dev, surfaceID, 0x80000000u | (pending ? 1u : 0u));
+    pthread_once(&g_phx_mark_once, nvmtl_phx_mark_open);
+    if (!g_phx_mark_conn) return 0x80000002u;
+    uint64_t in[2] = { surfaceID, pending ? 1u : 0u }, out = 0x80000002u; uint32_t n = 1;
+    if (IOConnectCallScalarMethod(g_phx_mark_conn, 22, in, 2, &out, &n) != KERN_SUCCESS) return 0x80000002u;
+    return (uint32_t)out;
 }
 /* 1 when NVAccel publishes NVAccelSurfaceWait: its page-off waits for a surface WindowServer's GPU is still writing */
 int nvmtl_vk_accel_surface_wait(void)
@@ -2284,17 +2312,21 @@ static VkDescriptorType binding_type(uint32_t i)
 static int nvmtl_desc_pool_open(void)
 {
     if (g_ndescPools == NVMTL_MAX_POOLS) {
-        nvlog("vk: descriptor pool CEILING: %u pools x %d sets all live in one frame — draws are being skipped", g_ndescPools, NVMTL_MAX_SETS);
+        nvlog("vk: descriptor pool CEILING: %u pools (up to %d sets each) all live in one frame — draws are being skipped", g_ndescPools, NVMTL_MAX_SETS);
         return -1;
     }
+    // A pool is a wired, CPU-mapped buffer of ~9 KB a set: 4096 sets made every Metal process hold 36 MiB from its first
+    // draw, Finder included (10-26, the Mac out of memory). The first pool takes 256 sets and each next one twice the
+    // last, up to 4096; allocation tries every open pool before opening another.
+    const uint32_t sets = g_ndescPools < 4 ? 256u << g_ndescPools : NVMTL_MAX_SETS;
     VkDescriptorPoolSize sizes[5] = {
-        { VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC, NVMTL_MAX_SETS },
-        { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, (NVMTL_NBUF + 1) * NVMTL_MAX_SETS },
-        { VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE,  NVMTL_NTEX  * NVMTL_MAX_SETS },
-        { VK_DESCRIPTOR_TYPE_SAMPLER,        NVMTL_NSAMP * NVMTL_MAX_SETS },
-        { VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,  NVMTL_NSTEX * NVMTL_MAX_SETS } };
+        { VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC, sets },
+        { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, (NVMTL_NBUF + 1) * sets },
+        { VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE,  NVMTL_NTEX  * sets },
+        { VK_DESCRIPTOR_TYPE_SAMPLER,        NVMTL_NSAMP * sets },
+        { VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,  NVMTL_NSTEX * sets } };
     VkDescriptorPoolCreateInfo pci = { VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO, NULL,
-        VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT, NVMTL_MAX_SETS, 5, sizes };
+        VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT, sets, 5, sizes };
     static const VkDescriptorType mut4[4] = { VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER,
                                               VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER };
     VkMutableDescriptorTypeListEXT plists[5] = { { 0, NULL }, { 0, NULL }, { 4, mut4 }, { 0, NULL }, { 4, mut4 } };
@@ -2304,8 +2336,7 @@ static int nvmtl_desc_pool_open(void)
     VKCK(pvkCreateDescriptorPool(g_dev, &pci, NULL, &g_descPools[g_ndescPools]), "vkCreateDescriptorPool");
     g_ndescPools++;
     if (g_ndescPools > 1)
-        nvlog("vk: descriptor pool %u opened — one frame needed more than %u sets (%u draws)",
-              g_ndescPools, (g_ndescPools - 1) * NVMTL_MAX_SETS, (g_ndescPools - 1) * NVMTL_MAX_SETS / 2);
+        nvlog("vk: descriptor pool %u opened (%u sets) — the open ones were full", g_ndescPools, sets);
     return 0;
 }
 
@@ -3563,6 +3594,20 @@ static uint32_t nvmtl_rt_shape(const nvk_pipeline *p, uint32_t cf[NVMTL_NCOL], u
     for (uint32_t i = 0; i < n; i++) cf[i] = p->cfmts[i];
     return n;
 }
+/* NVMTL_RP_LIGHT=1 (WindowServer only): a render pass keeps only its entry dependency (everything before it, flushed and
+   waited for) and drops its exit one. The next pass's entry, and the barriers blits and compute put before themselves,
+   already order what follows, so every pass paid two full GPU drains with cache flushes where one does. */
+static int nvmtl_rp_light(void)
+{
+    static int on = -1;
+    if (on < 0) {
+        const char *e = getenv("NVMTL_RP_LIGHT");
+        on = e && e[0] == '1' && getprogname() && !strcmp(getprogname(), "WindowServer");
+        if (on) nvlog("render passes: entry dependency only (NVMTL_RP_LIGHT=1)");
+    }
+    return on;
+}
+
 static VkResult nvmtl_make_render_pass(const nvk_pipeline *p, uint32_t load, VkRenderPass *out)
 {
     VkSampleCountFlagBits sc = (VkSampleCountFlagBits)(p->samples > 1 ? p->samples : 1);
@@ -3613,7 +3658,9 @@ static VkResult nvmtl_make_render_pass(const nvk_pipeline *p, uint32_t load, VkR
           VK_ACCESS_MEMORY_WRITE_BIT, VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT, 0 },
         { 0, 0, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
           VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT, VK_ACCESS_INPUT_ATTACHMENT_READ_BIT, VK_DEPENDENCY_BY_REGION_BIT } };
+    const VkSubpassDependency light[2] = { deps[0], deps[2] };
     VkRenderPassCreateInfo rpci = { VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO, NULL, 0, n, atts, 1, &sp, fetch ? 3u : 2u, deps };
+    if (nvmtl_rp_light()) { rpci.dependencyCount = fetch ? 2u : 1u; rpci.pDependencies = light; }
     return pvkCreateRenderPass(g_dev, &rpci, NULL, out);
 }
 int nvmtl_vk_pipeline_create_blend(const void *vs, size_t vn, const void *fs, size_t fn, uint32_t vkfmt, uint32_t depthfmt, const nvk_blend_state *blend, nvk_pipeline *out)
@@ -5150,7 +5197,9 @@ static VkResult nvmtl_make_render_pass_shape(const nvk_pipeline *p, uint32_t loa
           VK_ACCESS_MEMORY_WRITE_BIT, VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT, 0, 0 },
         { VK_STRUCTURE_TYPE_SUBPASS_DEPENDENCY_2, NULL, 0, 0, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
           VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT, VK_ACCESS_INPUT_ATTACHMENT_READ_BIT, VK_DEPENDENCY_BY_REGION_BIT, 0 } };
+    const VkSubpassDependency2 light2[2] = { deps2[0], deps2[2] };
     VkRenderPassCreateInfo2 rci = { VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO_2, NULL, 0, n, atts, 1, &sp, fetch ? 3u : 2u, deps2, 0, NULL };
+    if (nvmtl_rp_light()) { rci.dependencyCount = fetch ? 2u : 1u; rci.pDependencies = light2; }
     return pvkCreateRenderPass2(g_dev, &rci, NULL, out);
 }
 typedef struct { uint64_t identity; uint32_t load, prm, dmode, smode; void *rp; } nvmtl_shape_rp;
@@ -5733,6 +5782,15 @@ int nvmtl_vk_submit_begin_at(nvk_cmdbuf *c, nvmtl_inflight *f, const char *who)
     if (!pro && nvmtl_pre_submit_hook) { const int k0 = g_perf_kind; g_perf_kind |= 1; nvmtl_pre_submit_hook(); g_perf_kind = k0; }
     const uint64_t sA = nvmtl_perf_now();
     const uint32_t wseq = nvmtl_keep_on() ? nvmtl_wit_record(c) : 0;
+    // With NVMTL_RP_LIGHT a pass no longer flushes its colour writes on exit, so the command buffer does it once here:
+    // its pixels must be in memory by the fence, where the display copy and other processes read them with the CPU.
+    // Without it a frame's last writes could still sit in the GPU's caches: typed characters missing from Spotlight
+    // and Messages until the next keystroke, stale bands across the top of the panel (2026-10-22).
+    if (nvmtl_rp_light() && !c->in_rp) {
+        VkMemoryBarrier mb = { VK_STRUCTURE_TYPE_MEMORY_BARRIER, NULL, VK_ACCESS_MEMORY_WRITE_BIT, VK_ACCESS_HOST_READ_BIT | VK_ACCESS_MEMORY_READ_BIT };
+        pvkCmdPipelineBarrier(c->cb, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT,
+                              0, 1, &mb, 0, NULL, 0, NULL);
+    }
     VkResult result = pvkEndCommandBuffer(c->cb);
     const uint64_t sB = nvmtl_perf_now();
     if (result != VK_SUCCESS) { nvmtl_cmd_retire(c); return -1; }
@@ -6139,8 +6197,14 @@ size_t nvmtl_vk_allocated_bytes(void) { return g_alloc_bytes; }
  * The upload itself stays synchronous: #96 also deferred the fence wait to overlap uploads, but
  * nvmtl_vk_image_destroy() frees an image and its memory at once, so an app that uploads a surface and frees it
  * (IOSurface-backed textures do) would leave the GPU copying into freed memory. A thread keeps at most
- * NVMTL_UPSTAGE_KEEP bytes between uploads (a 4K BGRA frame); a larger one-off upload frees its buffer afterwards. */
-#define NVMTL_UPSTAGE_KEEP (32u << 20)
+ * nvmtl_upstage_keep() bytes between uploads; a larger one-off upload frees its buffer afterwards. WindowServer keeps a 4K
+ * BGRA frame's worth (32 MiB); every other process 4 MiB, since each thread's kept buffer is wired memory (10-26). */
+static size_t nvmtl_upstage_keep(void)
+{
+    static size_t keep;
+    if (!keep) keep = (getprogname() && !strcmp(getprogname(), "WindowServer")) ? (32u << 20) : (4u << 20);
+    return keep;
+}
 typedef struct { nvk_buffer buf; nvk_cmdbuf cb; } nvmtl_upstage;
 static pthread_key_t g_upstage_key; static pthread_once_t g_upstage_once = PTHREAD_ONCE_INIT;
 static void nvmtl_upstage_free(void *p)
@@ -6234,7 +6298,7 @@ int nvmtl_vk_image_write(nvk_queue *q, nvk_image *img, const void *src, size_t r
     pvkCmdPipelineBarrier(c->cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0, 0, NULL, 0, NULL, 1, &toRead);
     img->layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
     const int rc = nvmtl_vk_submit_wait_at(c, "surface upload");
-    if (sl->buf.size > NVMTL_UPSTAGE_KEEP) { nvmtl_vk_buffer_destroy(&sl->buf); memset(&sl->buf, 0, sizeof sl->buf); }
+    if (sl->buf.size > nvmtl_upstage_keep()) { nvmtl_vk_buffer_destroy(&sl->buf); memset(&sl->buf, 0, sizeof sl->buf); }
     return rc;
 }
 
@@ -6276,6 +6340,48 @@ int nvmtl_vk_image_read(nvk_queue *q, nvk_image *img, void *dst, size_t row_byte
     const uint8_t *src = (const uint8_t *)stage.map;
     for (uint32_t y = 0; y < rows; y++) memcpy((uint8_t *)dst + y * row_bytes, src + (size_t)y * cols * bpp, (size_t)cols * bpp);
     return 0;
+}
+
+// Copy a private image to or from an IOSurface whose own pages are imported as hb, row_bytes apart: the GPU moves the
+// pixels and the CPU copies nothing. RADV makes no linear image over a row that is not a multiple of 256 bytes, so an
+// OpenGL surface (rows of width x 4 bytes) got a private image that surface-in and surface-out copied through a staging
+// buffer with memcpy: 2 x 14 MB a frame at 2400x1500, ~13 ms, and 3D OpenGL apps such as Chess stuck near 60 fps or
+// below (10-23). Uncompressed formats with whole texels per row only; the caller keeps the copying path otherwise.
+// Also a buffer texture whose rows RADV will not alias (newTextureWithDescriptor:offset:bytesPerRow:) is filled from
+// its buffer this way, from offset.
+int nvmtl_vk_image_host_xfer(nvk_queue *q, nvk_image *img, nvk_buffer *hb, size_t offset, size_t row_bytes, int to_image)
+{
+    const size_t bpp = img->bpp ? img->bpp : 4;
+    if (img->bw > 1 || img->bh > 1 || row_bytes % bpp || row_bytes / bpp < img->w || offset % 4 || offset % bpp
+        || offset > hb->size || row_bytes * (img->h - 1) + (size_t)img->w * bpp > hb->size - offset) return -1;
+    if (!to_image) nvmtl_vk_image_upload_barrier(img);   // a readback must observe a pending async upload: finish it first
+    nvk_cmdbuf c; if (nvmtl_vk_cmd_begin(q, &c)) return -1;
+    VkImageSubresourceRange range = { nvmtl_barrier_aspect(img), 0, 1, 0, 1 };
+    VkBufferImageCopy bic = { offset, (uint32_t)(row_bytes / bpp), 0, { nvmtl_copy_aspect(img), 0, 0, 1 }, { 0, 0, 0 }, { img->w, img->h, 1 } };
+    if (to_image) {
+        VkImageMemoryBarrier toDst = { VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER, NULL, 0, VK_ACCESS_TRANSFER_WRITE_BIT,
+            VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+            VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED, (VkImage)img->img, range };
+        pvkCmdPipelineBarrier(c.cb, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, NULL, 0, NULL, 1, &toDst);
+        pvkCmdCopyBufferToImage(c.cb, (VkBuffer)hb->buf, (VkImage)img->img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &bic);
+        VkImageMemoryBarrier toRead = { VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER, NULL,
+            VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT,
+            VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+            VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED, (VkImage)img->img, range };
+        pvkCmdPipelineBarrier(c.cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0, 0, NULL, 0, NULL, 1, &toRead);
+        img->layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    } else {
+        VkImageMemoryBarrier toSrc = { VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER, NULL,
+            VK_ACCESS_MEMORY_WRITE_BIT | VK_ACCESS_MEMORY_READ_BIT, VK_ACCESS_TRANSFER_READ_BIT,
+            (VkImageLayout)img->layout, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+            VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED, (VkImage)img->img, range };
+        pvkCmdPipelineBarrier(c.cb, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, NULL, 0, NULL, 1, &toSrc);
+        img->layout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+        pvkCmdCopyImageToBuffer(c.cb, (VkImage)img->img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, (VkBuffer)hb->buf, 1, &bic);
+        VkMemoryBarrier toHost = { VK_STRUCTURE_TYPE_MEMORY_BARRIER, NULL, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_HOST_READ_BIT };
+        pvkCmdPipelineBarrier(c.cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT, 0, 1, &toHost, 0, NULL, 0, NULL);
+    }
+    return nvmtl_vk_submit_wait(&c);
 }
 
 static void img_to(nvk_cmdbuf *c, nvk_image *img, VkImageLayout to,
@@ -7572,8 +7678,13 @@ static int pool_buffer_create_in(int vram, size_t size, nvk_buffer *out)
     pool_block *blk = *head; size_t off = 0; int got = 0;
     for (; blk; blk = blk->next) if (pool_block_take(blk, len, &off)) { got = 1; break; }
     if (!got) {
+        // Every block is wired system memory, and each Metal process took a whole 32 MiB one for its first small buffer:
+        // ~50 GPU clients held over 1 GiB that way while the Mac ran out of memory (10-26). Blocks start at 4 MiB and
+        // double the pool each time, so a busy process still reaches the cap in a few steps.
+        size_t have = 0; for (pool_block *p = *head; p; p = p->next) have += p->heap.size;
+        const size_t cap = vram ? NVMTL_VPOOL_BLOCK : NVMTL_POOL_BLOCK, bs = have < NVMTL_POOL_FIRST ? NVMTL_POOL_FIRST : have > cap ? cap : have;
         pool_block *nb = calloc(1, sizeof *nb);
-        if (!nb || (vram ? vpool_heap_create(NVMTL_VPOOL_BLOCK, &nb->heap) : nvmtl_vk_heap_create(NVMTL_POOL_BLOCK, 1, &nb->heap))) { free(nb); pthread_mutex_unlock(&g_pool_lock); return -1; }
+        if (!nb || (vram ? vpool_heap_create(bs, &nb->heap) : nvmtl_vk_heap_create(bs, 1, &nb->heap))) { free(nb); pthread_mutex_unlock(&g_pool_lock); return -1; }
         nb->vram = vram; nb->next = *head; *head = nb; g_pool_blocks++; if (vram) g_vpool_blocks++;
         nvlog("buffer pool: block #%llu mapped (%zu MiB, %s; %llu VRAM blocks, memory type %u); %llu pooled buffers live in %llu bytes of ranges",
               (unsigned long long)g_pool_blocks, nb->heap.size >> 20, pool_place_why(vram), (unsigned long long)g_vpool_blocks,

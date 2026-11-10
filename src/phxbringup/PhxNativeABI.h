@@ -13,6 +13,7 @@
 #define PHX_NATIVE_ABI_H
 
 #include <stdint.h>
+#include "../amd/phx_topology.h"
 
 #define PHXN_UC_TYPE      0x4E34384Eu   /* 'N48N' */
 #define PHXN_ABI_VERSION  1u
@@ -36,6 +37,9 @@ enum {
     PHXN_SEL_CTX       = 6,
     PHXN_SEL_SUBMIT    = 7,
     PHXN_SEL_WAITSEQ   = 8,
+    PHXN_SEL_TOPOLOGY  = 30,
+    PHXN_SEL_SURF_GPU_MARK = 22,   /* in: [0] IOSurface id [1] 1 pending, 0 ready -> out [0] the accelerator's answer (0 taken):
+                                      WindowServer's composite marks, handed to PhxAccel's NMXAccel (nvSurfVram) */
     PHXN_SEL_BOIMPORTHOST = 21,    /* ABI 1.9: in [0] host VA [1] size [2] flags 0 [3] GPU VA 0 -> out [0] handle [1] size [2] 0 [3] bits */
     /* Phoenix-only debug selectors: root, and only with the boot-arg phxdebug=1. */
     PHXN_SEL_DBG_SMU   = 100,  /* in: [0] SMU 13.0.4 message id (allow-list) [1] argument   out: [0] response [1] argument register after */
@@ -128,6 +132,15 @@ enum {
 #define PHX_PPSMC_AllowGfxOff          0x19u
 #define PHX_PPSMC_DisallowGfxOff       0x1Au
 #define PHX_PPSMC_EnableGfxImu         0x16u  /* smu_v13_0_4_ppsmc.h: power up GFX via the IMU (APU GFX bring-up) */
+/* clocks (smu_v13_0_4_ppsmc.h; frequencies in MHz, as Linux's set_soft_freq_limited_range sends them) */
+#define PHX_PPSMC_SetHardMinSocclkByFreq 0x13u
+#define PHX_PPSMC_GetGfxclkFrequency   0x17u
+#define PHX_PPSMC_GetFclkFrequency     0x18u
+#define PHX_PPSMC_SetSoftMaxGfxClk     0x1Bu
+#define PHX_PPSMC_SetHardMinGfxClk     0x1Cu
+#define PHX_PPSMC_SetSoftMaxSocclkByFreq 0x1Du
+#define PHX_PPSMC_SetSoftMaxFclkByFreq 0x1Eu
+#define PHX_PPSMC_SetHardMinFclkByFreq 0x23u
 
 /* n48n_info.flags */
 #define PHXN_INFO_HUNG         (1u << 0)

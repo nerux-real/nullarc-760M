@@ -821,11 +821,27 @@ static NVMTLTexture *nvmtl_texbuf_make(NVMTLBuffer *b, MTLTextureDescriptor *d, 
     const uint32_t bkey[12] = { 2, (uint32_t)w, (uint32_t)h, vkf, bpp, (uint32_t)a8, (d.usage & MTLTextureUsageShaderWrite) != 0,
         (d.usage & MTLTextureUsageRenderTarget) != 0, (uint32_t)offset, (uint32_t)((uint64_t)offset >> 32), (uint32_t)bpr, (uint32_t)((uint64_t)bpr >> 32) };
     const BOOL brec = !noRecycle && _nbpk && nvmtl_bpark_take(self, bkey, &t->_i) == 0;
+    BOOL copied = NO;
     if (!brec && nvmtl_vk_image_create_buffer_alias((uint32_t)w, (uint32_t)h, vkf, bpp, a8, (d.usage & MTLTextureUsageShaderWrite) != 0,
                                            (d.usage & MTLTextureUsageRenderTarget) != 0, &_b, offset, bpr, &t->_i)) {
-        nvlog("buffer newTextureWithDescriptor:offset:%lu bytesPerRow:%lu (%zux%zu fmt %lu, buffer %lu B, storage %lu) -> nil (reason above)",
-              (unsigned long)offset, (unsigned long)bpr, w, h, (unsigned long)d.pixelFormat, (unsigned long)_b.size, (unsigned long)_storage);
+        // RADV aliases only rows that are a multiple of 256 bytes. CoreAnimation hands WindowServer small layer contents
+        // (a line of typed text 234x18, rows of 960 bytes; A8 glyph masks 29x29 to 66x27, rows of 64 or 128) as buffers, and each nil
+        // here left that layer undrawn: typed characters vanished in Spotlight and Messages until a longer line happened
+        // to get a usable pitch (10-23). Such a texture gets a private image instead, which the GPU refills from the buffer
+        // when the buffer's bytes have changed (nvmtlSurfaceIn) and copies back after drawing into it (nvmtlSurfaceOut).
+        const BOOL writes = (d.usage & MTLTextureUsageShaderWrite) != 0;
+        if ((!writes || nvmtl_vk_format_is_storage(vkf)) && bpp && bpr % bpp == 0 && bpr >= w * bpp && offset % 4 == 0 && offset % bpp == 0
+            && offset + bpr * (h - 1) + w * bpp <= _b.size
+            && !nvmtl_vk_image_create_typed((uint32_t)w, (uint32_t)h, vkf, bpp, a8, 1, writes, 2u, 1u, &t->_i)) {
+            copied = YES; t->_bufCopy = YES;
+            static unsigned nc; if (nc++ < 8 || nc % 1000 == 0)
+                nvlog("buffer newTextureWithDescriptor:offset:%lu bytesPerRow:%lu (%zux%zu fmt %lu) -> a private image refilled from the buffer at each use (#%u)",
+                      (unsigned long)offset, (unsigned long)bpr, w, h, (unsigned long)d.pixelFormat, nc);
+        } else {
+        nvlog("buffer newTextureWithDescriptor:offset:%lu bytesPerRow:%lu (%zux%zu fmt %lu usage 0x%lx, buffer %lu B, storage %lu) -> nil (reason above)",
+              (unsigned long)offset, (unsigned long)bpr, w, h, (unsigned long)d.pixelFormat, (unsigned long)d.usage, (unsigned long)_b.size, (unsigned long)_storage);
         return nil; }
+    }
     t->_q = nvmtl_device_queue();
     t->_fmt = d.pixelFormat; t->_mips = 1;
     t->_stex = t->_i.storage != 0;
@@ -833,7 +849,7 @@ static NVMTLTexture *nvmtl_texbuf_make(NVMTLBuffer *b, MTLTextureDescriptor *d, 
     t->_usage = d.usage;
     _texSeen = YES;
     t->_backBuf = self; t->_backOff = offset; t->_backBPR = bpr;
-    t->_bparkable = !noRecycle; memcpy(t->_pkey, bkey, sizeof bkey);
+    t->_bparkable = !noRecycle && !copied; memcpy(t->_pkey, bkey, sizeof bkey);
     atomic_fetch_add(brec ? &gBTRecycled : &gBTNew, 1); nvmtl_buftex_census(brec ? "recycled" : "new");
     nvmtl_texture_desc_swizzle(t, d);
     nvlog("buffer %p newTextureWithDescriptor:offset:%lu bytesPerRow:%lu -> %p (%zux%zu fmt %lu usage 0x%lx, storage %lu)", (__bridge void *)self,
@@ -910,7 +926,7 @@ void nvmtl_vk_buffer_retire(nvk_buffer *b);
 static void nvmtl_surf_dirty(NVMTLCommandBuffer *cb, NVMTLTexture *t) {
     if (!cb || !t) return;
     NVMTLTexture *r = t->_parent ? t->_parent : t;
-    if (!r->_surf) return;
+    if (!r->_surf && !r->_bufCopy) return;
     if (!cb->_surfDirty) cb->_surfDirty = [NSMutableSet new];
     [cb->_surfDirty addObject:r];
 }
@@ -1178,7 +1194,7 @@ void nvmtl_texture_desc_swizzle(NVMTLTexture *t, MTLTextureDescriptor *d) {
     if (!_parent) nvmtl_vk_image_destroy(&_i);
     if (_stTwin.img) nvmtl_vk_image_destroy(&_stTwin);
     if (!_parent && _vramOn) { nvmtl_vk_buffer_destroy(&_vramBuf); _vramOn = NO; }
-    if (!_parent && _hostOn) { nvmtl_vk_buffer_destroy(&_hostBuf); _hostOn = NO; }
+    if (!_parent && (_hostOn || _hostCopy)) { nvmtl_vk_buffer_destroy(&_hostBuf); _hostOn = _hostCopy = NO; }
     if (_surfOwned && _surf) CFRelease(_surf);
     if (_subHeap) { NVMTLHeap *h = _subHeap; NSUInteger c = _subCharge; _subHeap = nil; _subCharge = 0;
                     if (_subPlaced && c) { _subPlaced = NO; [h nvmtlGiveRange:_heapOffset length:c]; }
@@ -1227,8 +1243,37 @@ static id nvmtl_surface_sync(NVMTLTexture *t) {
         return monitor;
     }
 }
+static void nvmtl_buffer_sync_in(NVMTLBuffer *b);
+static void nvmtl_buffer_sync_out(NVMTLBuffer *b);
+// The CPU's view of a buffer texture's bytes (NULL for a buffer the CPU cannot see) and a hash of its rows.
+static const uint8_t *nvmtl_buftex_bytes(NVMTLTexture *r) {
+    const uint8_t *p = (const uint8_t *)[r->_backBuf contents];
+    return p ? p + r->_backOff : NULL;
+}
+static uint64_t nvmtl_buftex_hash(NVMTLTexture *r, const uint8_t *p) {
+    uint64_t h = 1469598103934665603ull;
+    const size_t row = (size_t)r->_i.w * (r->_i.bpp ? r->_i.bpp : 4);
+    for (uint32_t y = 0; y < r->_i.h; y++) {
+        const uint8_t *q = p + (size_t)y * r->_backBPR; size_t i = 0;
+        for (; i + 8 <= row; i += 8) { uint64_t v; memcpy(&v, q + i, 8); h = (h ^ v) * 1099511628211ull; }
+        for (; i < row; i++) h = (h ^ q[i]) * 1099511628211ull;
+    }
+    return h;
+}
 - (void)nvmtlSurfaceIn {
     NVMTLTexture *r = _parent ? _parent : self;
+    if (r->_bufCopy) {   // refilled when the buffer's bytes differ from what the image last matched (no seed to compare)
+        @synchronized (r) {
+        const uint8_t *p = nvmtl_buftex_bytes(r);
+        const uint64_t h = p ? nvmtl_buftex_hash(r, p) : 0;
+        if (r->_bufHashed && (!p || h == r->_bufHash)) return;   // unchanged, or only the GPU can change it
+        nvmtl_buffer_sync_in(r->_backBuf);   // a no-copy buffer whose pages were not imported is a copy: bring it up first
+        if (nvmtl_vk_image_host_xfer(r->_q, &r->_i, &r->_backBuf->_b, r->_backOff, r->_backBPR, 1))
+            { static int said; if (said++ < 4) nvlog("buffer texture copy: refill FAILED (%ux%u at offset %lu, bytesPerRow %lu)", r->_i.w, r->_i.h, (unsigned long)r->_backOff, (unsigned long)r->_backBPR); return; }
+        r->_bufHash = h; r->_bufHashed = YES;
+        }
+        return;
+    }
     if (!r->_surf || r->_hostOn) return;   // host-backed: the GPU reads the surface's own pages
     @synchronized (nvmtl_surface_sync(r)) {
     const uint32_t vgen = r->_vramOn ? 0 : nvmtl_vram_gen(r->_surf, r->_plane);
@@ -1243,7 +1288,9 @@ static id nvmtl_surface_sync(NVMTLTexture *t) {
     if (IOSurfaceLock(r->_surf, kIOSurfaceLockReadOnly, &seed) != kIOReturnSuccess) { nvlog("G13 surface-in: IOSurfaceLock FAILED"); return; }
     void *base = IOSurfaceGetBaseAddressOfPlane(r->_surf, (uint32_t)r->_plane);
     size_t row = IOSurfaceGetBytesPerRowOfPlane(r->_surf, (uint32_t)r->_plane);
-    int rc = (base && row) ? nvmtl_vk_image_write(r->_q, &r->_i, base, row) : -1;
+    int rc = -1;
+    if (r->_hostCopy && row == r->_hostRow) rc = nvmtl_vk_image_host_xfer(r->_q, &r->_i, &r->_hostBuf, 0, row, 1);
+    if (rc && base && row) rc = nvmtl_vk_image_write(r->_q, &r->_i, base, row);
     if (!rc && r->_i.bpp == 4) { char tag[24]; snprintf(tag, sizeof tag, "in%u-", (unsigned)IOSurfaceGetID(r->_surf)); nvmtl_frame_dump(tag, base, row, r->_i.w, r->_i.h); }
     IOSurfaceUnlock(r->_surf, kIOSurfaceLockReadOnly, NULL);
     if (rc) { nvlog("G13 surface-in: upload FAILED (%ux%u) — retried at the next use", r->_i.w, r->_i.h); return; }
@@ -1284,6 +1331,17 @@ static void nvmtl_surface_remark_later(NVMTLTexture *r, uint32_t seed) {
 // off this thread (nvmtl_surface_remark_later).
 - (BOOL)nvmtlSurfaceOutDirtied:(BOOL)dirtied {
     NVMTLTexture *r = _parent ? _parent : self;
+    if (r->_bufCopy) {   // the GPU drew into the stand-in: its buffer gets the pixels, and the hash what the CPU now sees
+        @synchronized (r) {
+        if (nvmtl_vk_image_host_xfer(r->_q, &r->_i, &r->_backBuf->_b, r->_backOff, r->_backBPR, 0)) {
+            static int said; if (said++ < 4) nvlog("buffer texture copy: write-back FAILED (%ux%u at offset %lu)", r->_i.w, r->_i.h, (unsigned long)r->_backOff);
+            return NO; }
+        nvmtl_buffer_sync_out(r->_backBuf);
+        const uint8_t *p = nvmtl_buftex_bytes(r);
+        if (p) { r->_bufHash = nvmtl_buftex_hash(r, p); r->_bufHashed = YES; }
+        }
+        return YES;
+    }
     if (!r->_surf || r->_hostOn) return YES;   // host-backed: the GPU wrote the surface's own pages
     @synchronized (nvmtl_surface_sync(r)) {
     if (![r nvmtlSurfaceCopyable]) { nvtrace("SURFOUT surf %u %ux%u NOT copyable", (unsigned)IOSurfaceGetID(r->_surf), r->_i.w, r->_i.h); return NO; }
@@ -1304,7 +1362,9 @@ static void nvmtl_surface_remark_later(NVMTLTexture *r, uint32_t seed) {
     if (IOSurfaceLock(r->_surf, lockopt, NULL) != kIOReturnSuccess) { nvlog("G13 surface-out: IOSurfaceLock FAILED"); return NO; }
     void *base = IOSurfaceGetBaseAddressOfPlane(r->_surf, (uint32_t)r->_plane);
     size_t row = IOSurfaceGetBytesPerRowOfPlane(r->_surf, (uint32_t)r->_plane);
-    int rc = (base && row) ? nvmtl_vk_image_read(r->_q, &r->_i, base, row) : -1;
+    int rc = -1;
+    if (r->_hostCopy && row == r->_hostRow) rc = nvmtl_vk_image_host_xfer(r->_q, &r->_i, &r->_hostBuf, 0, row, 0);
+    if (rc && base && row) rc = nvmtl_vk_image_read(r->_q, &r->_i, base, row);
     if (!rc && r->_i.bpp == 4) { char tag[24]; snprintf(tag, sizeof tag, "out%u-", (unsigned)IOSurfaceGetID(r->_surf)); nvmtl_frame_dump(tag, base, row, r->_i.w, r->_i.h); }
     uint32_t seed = 0; IOReturn unlocked = IOSurfaceUnlock(r->_surf, lockopt, &seed); if (lockopt) seed = IOSurfaceGetSeed(r->_surf);
     if (rc || unlocked != kIOReturnSuccess) { nvlog("G13 surface-out: readback FAILED (%ux%u)", r->_i.w, r->_i.h); return NO; }
@@ -2488,10 +2548,13 @@ static size_t nvmtl_fc_width(NSUInteger dataType)
         NVMTLFunction *f = [NVMTLFunction new]; f->_spirv = nil; f->_fc = [constants copy]; f->_fname = name; f->_stage = _stages[name];
         f->_air = _airs[name]; f->_lib = self; f->_fcv = cv; return f;
     }
+    // a function calling visible functions translates only once they are linked in: asking the translator first cost
+    // ~4.5 minutes on MPS's depthwise convolution before it failed, on every run (failures are not cached, 2026-10-26)
+    const BOOL vref = _airs[name] && nvmtl_needs_visible_link(_airs[name], nil);
     nvmtl_fc_expect_link(1);
-    NSData *spec = nvmtl_translate_with_fc_cached(_airs[name], _stages[name], name, constants, idx, sz, pay, n, &e);
+    NSData *spec = vref ? nil : nvmtl_translate_with_fc_cached(_airs[name], _stages[name], name, constants, idx, sz, pay, n, &e);
     nvmtl_fc_expect_link(0);
-    if (!spec && _airs[name] && nvmtl_needs_visible_link(_airs[name], e)) {
+    if (!spec && _airs[name] && (vref || nvmtl_needs_visible_link(_airs[name], e))) {
         nvlog("newFunctionWithName:constantValues: \"%s\" has visible-function references - DEFERRED to pipeline creation (%zu constant(s))", name.UTF8String, n);
         if (error) *error = nil;
         NVMTLFunction *f = [NVMTLFunction new]; f->_spirv = nil; f->_fc = [constants copy]; f->_fname = name; f->_stage = (_stages[name] ?: @"");
@@ -2846,6 +2909,7 @@ static BOOL nvmtl_pixel_sampler_update(NSMutableDictionary *states, NSString *in
                 if (ca.loadAction == MTLLoadActionClear) nvmtl_surface_overwrite_recorded(cb, sr);
                 else nvmtl_surface_in_for_cb(cb, sr);
                 nvmtl_surf_dirty(cb, sr); }
+            else if (sr->_bufCopy) { if (ca.loadAction != MTLLoadActionClear) nvmtl_surface_in_for_cb(cb, sr); nvmtl_surf_dirty(cb, sr); }
         }
         MTLStoreAction sa = ca.storeAction;
         if ((sa == MTLStoreActionMultisampleResolve || sa == MTLStoreActionStoreAndMultisampleResolve || sa == MTLStoreActionUnknown) && rx) {
@@ -5003,7 +5067,8 @@ destinationBytesPerImage:(NSUInteger)img options:(MTLBlitOption)opt {
         if (sr->_surf) {
             if (d.colorAttachments[0].loadAction == MTLLoadActionClear) nvmtl_surface_overwrite_recorded(self, sr);
             else nvmtl_surface_in_for_cb(self, sr);
-            nvmtl_surf_dirty(self, sr); } }
+            nvmtl_surf_dirty(self, sr); }
+        else if (sr->_bufCopy) { if (d.colorAttachments[0].loadAction != MTLLoadActionClear) nvmtl_surface_in_for_cb(self, sr); nvmtl_surf_dirty(self, sr); } }
     const float defaultBlend[4] = { 0, 0, 0, 0 };
     nvmtl_vk_cmd_set_blend_color(&_c, defaultBlend);
     nvmtl_vk_cmd_set_line_width(&_c, 1.0f);
@@ -5082,16 +5147,31 @@ destinationBytesPerImage:(NSUInteger)img options:(MTLBlitOption)opt {
 - (void)popDebugGroup {}
 - (void)encodeSignalEvent:(id<MTLEvent>)e value:(uint64_t)v { [self nvmtlRecordSignal:e value:v]; }
 - (void)encodeWaitForEvent:(id<MTLEvent>)e value:(uint64_t)v { [self nvmtlRecordWait:e value:v]; }
+// Whether cb wrote an IOSurface (its parts' dirtied surfaces), which something outside this queue may read: the display
+// pipe, a capture's CPU lock, another process.
+static BOOL nvmtl_cb_writes_surfaces(NVMTLCommandBuffer *cb) {
+    for (NVMTLSubmissionPart *part in cb->_parts) {
+        if (![part isKindOfClass:[NVMTLSubmissionPart class]]) continue;
+        for (NVMTLTexture *t in part->surfaces) if (t->_surf) return YES;
+    }
+    return NO;
+}
 // The display-pipe swap follows this call immediately in WindowServer. NVAccel
 // cannot order that swap after an NVK fence, so wait for the pixels to finish
 // before allowing the surface to become scanout. Other applications keep the
 // normal submission-only contract.
 - (BOOL)commitAndWaitUntilSubmitted {
-    static int ws = -1;
+    static int ws = -1, internalWait = -1;
     if (ws < 0) ws = (getprogname() && !strcmp(getprogname(), "WindowServer")) ? 1 : 0;
+    if (internalWait < 0) { const char *e = getenv("NVMTL_WS_WAIT_INTERNAL"); internalWait = e && e[0] == '1'; }
     [self commit];
-    // nvmtl_ws_kernel_waits: the swap waits for this composite in NVAccel instead (nvmtl_ws_mark_pending at commit)
-    if (ws && !nvmtl_ws_kernel_waits()) [self waitUntilCompleted]; else [self waitUntilScheduled];
+    // nvmtl_ws_kernel_waits: the swap waits for this composite in NVAccel instead (nvmtl_ws_mark_pending at commit).
+    // Without it WindowServer still waits here only for a command buffer that wrote an IOSurface. CoreAnimation's
+    // offscreen passes (its set_surface flushes) draw into the plugin's own textures, which only later work on this
+    // in-order queue reads; waiting for each of them serialised CPU and GPU, 1.8 ms a frame while a Phone window was
+    // dragged (2026-10-21). NVMTL_WS_WAIT_INTERNAL=1 waits for those again.
+    if (ws && !nvmtl_ws_kernel_waits() && (internalWait || nvmtl_cb_writes_surfaces(self))) [self waitUntilCompleted];
+    else [self waitUntilScheduled];
     return self.status != MTLCommandBufferStatusError;
 }
 - (void)commit {

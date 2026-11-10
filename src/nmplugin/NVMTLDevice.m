@@ -912,6 +912,7 @@ static int nvmtl_surface_image_create(NVMTLTexture *t, IOSurfaceRef surf, NSUInt
     // panel then copied the write-combined result again (2026-10-20). NVMTL_NO_SURFACE_HOST=1 keeps the copies.
     static int hostOn = -1;
     if (hostOn < 0) hostOn = nvmtl_vk_vendor() == 0x1002 && !getenv("NVMTL_NO_SURFACE_HOST");
+    nvk_buffer copyBuf = { 0 }; size_t copyRow = 0;   // the imported pages, kept for a private image's GPU copies
     if (hostOn && surf && plane == 0 && IOSurfaceGetPlaneCount(surf) <= 1) {
         void *base = IOSurfaceGetBaseAddress(surf);
         const size_t row = IOSurfaceGetBytesPerRow(surf), sh = IOSurfaceGetHeight(surf), al = nvmtl_vk_host_import_align();
@@ -928,7 +929,7 @@ static int nvmtl_surface_image_create(NVMTLTexture *t, IOSurfaceRef surf, NSUInt
                         nvlog("surface %u %ux%u pitch %zu -> its own pages (host import, no copies)", (unsigned)IOSurfaceGetID(surf), w, h, row);
                     return 0;
                 }
-                nvmtl_vk_buffer_destroy(&hb);
+                copyBuf = hb; copyRow = row;   // no linear image at this pitch (RADV wants 256-byte rows)
             }
         }
     }
@@ -938,6 +939,7 @@ static int nvmtl_surface_image_create(NVMTLTexture *t, IOSurfaceRef surf, NSUInt
             nvk_buffer vb;
             if (!nvmtl_vk_surface_vram(IOSurfaceGetID(surf), 0, row * h, &vb)) {
                 if (!nvmtl_vk_image_create_buffer_alias(w, h, vkf, bpp, a8, stex, 1, &vb, 0, row, &t->_i)) {
+                    if (copyBuf.buf) nvmtl_vk_buffer_destroy(&copyBuf);
                     t->_vramBuf = vb; t->_vramOn = YES; g_surf_vram++;
                     uint32_t seed = IOSurfaceGetSeed(surf);
                     int current = nvmtl_vram_tag_current(surf, 0, seed);
@@ -958,12 +960,17 @@ static int nvmtl_surface_image_create(NVMTLTexture *t, IOSurfaceRef surf, NSUInt
     if (!stex && nvmtl_vk_format_is_storage(vkf)) stex = 1;
     if (surf) {
         const size_t prow = IOSurfaceGetBytesPerRow(surf), pplanes = IOSurfaceGetPlaneCount(surf);
-        nvlog("item 7: surface %u %ux%u plane %lu -> a private image, copied in and out (%s; row %zu bytes, %zu plane(s))",
-              (unsigned)IOSurfaceGetID(surf), w, h, (unsigned long)plane,
+        nvlog("item 7: surface %u %ux%u plane %lu -> a private image, copied in and out %s (%s; row %zu bytes, %zu plane(s))",
+              (unsigned)IOSurfaceGetID(surf), w, h, (unsigned long)plane, copyBuf.buf ? "by the GPU over the surface's imported pages" : "through the CPU",
               (plane != 0 || pplanes > 1) ? "more than one plane" : ((size_t)w * (bpp ? bpp : 4) > prow || h > IOSurfaceGetHeight(surf)) ? "image larger than the surface"
-              : (prow % 32) ? "the row is not a multiple of 32 bytes" : "the family VRAM could not be used", prow, pplanes);
+              : (prow % 32) ? "the row is not a multiple of 32 bytes" : copyBuf.buf ? "no linear image at this row pitch" : "the family VRAM could not be used", prow, pplanes);
     }
-    return nvmtl_vk_image_create_typed(w, h, vkf, bpp, a8, 1, stex, 2u, 1u, &t->_i);
+    const int rc = nvmtl_vk_image_create_typed(w, h, vkf, bpp, a8, 1, stex, 2u, 1u, &t->_i);
+    if (copyBuf.buf) {
+        if (rc) nvmtl_vk_buffer_destroy(&copyBuf);
+        else { t->_hostBuf = copyBuf; t->_hostCopy = YES; t->_hostRow = copyRow; }
+    }
+    return rc;
 }
 
 static char nvmtl_surface_cache_key, nvmtl_surface_keep_key;
@@ -1349,8 +1356,21 @@ static void nvmtl_stitch_dump(const char *what, NSString *dag, NSArray *fns, id 
     if (!u) return nvmtl_fail(err, [NSString stringWithFormat:@"newDefaultLibraryWithBundle: %@ has no default.metallib", b.bundlePath]);
     return [self newLibraryWithURL:u error:err];
 }
+// Apple's neural-network kernels (Espresso's convolutions, MPSNeuralNetwork) hang this GPU within seconds of starting:
+// XProtect's remediators and Photos' analysis ran them in the background and took WindowServer down with them
+// (2026-10-21, 2026-10-22). Their libraries are refused here, so those frameworks run the networks on the CPU.
+// NVMTL_ALLOW_NN=1 lets them through, for debugging the hang.
+static BOOL nvmtl_nn_library(NSString *path) {
+    static int allow = -1;
+    if (allow < 0) { const char *e = getenv("NVMTL_ALLOW_NN"); allow = e && e[0] == '1'; }
+    if (allow || !path) return NO;
+    if (![path containsString:@"/Espresso.framework/"] && ![path containsString:@"/MPSNeuralNetwork.framework/"]) return NO;
+    static int said; if (!said++) nvlog("library: %s refused - neural-network kernels hang this GPU, the framework runs them on the CPU", path.UTF8String);
+    return YES;
+}
 - (id<MTLLibrary>)newLibraryWithURL:(NSURL *)url error:(NSError **)err {
     if (err) *err = nil;
+    if (nvmtl_nn_library(url.path)) return nvmtl_fail(err, @"newLibraryWithURL: neural-network kernels are not run on this GPU");
     NSString *fp = url.isFileURL ? url.absoluteURL.path : nil; struct stat s0; int st0 = fp ? stat(fp.fileSystemRepresentation, &s0) : -1;
     NSData *d = [NSData dataWithContentsOfURL:url];
     if (!d && url.path.length) {
@@ -1373,6 +1393,7 @@ static void nvmtl_stitch_dump(const char *what, NSString *dag, NSArray *fns, id 
 - (id<MTLLibrary>)nvmtlLibraryFromPath:(NSString *)path error:(NSError **)err {
     if (err) *err = nil;
     if (!path) return nvmtl_fail(err, @"newLibraryWithFile: nil path");
+    if (nvmtl_nn_library(path)) return nvmtl_fail(err, @"newLibraryWithFile: neural-network kernels are not run on this GPU");
     struct stat s0; const int st0 = stat(path.fileSystemRepresentation, &s0);
     NSData *d = [NSData dataWithContentsOfFile:path];
     if (!d) return nvmtl_fail(err, [NSString stringWithFormat:@"newLibraryWithFile: cannot read %@", path]);
@@ -2107,6 +2128,11 @@ static void nvmtl_log_compute_descriptor(MTLComputePipelineDescriptor *d) {
     if (!said++) nvlog("minimumLinearTextureAlignmentForPixelFormat: -> %llu (NVK asked %llu, Apple's D300 ruler 256)",
                        (unsigned long long)v, (unsigned long long)a);
     return (NSUInteger)v;
+}
+
+- (NSUInteger)minimumTextureBufferAlignmentForPixelFormat:(MTLPixelFormat)fmt {
+    (void)fmt;
+    return 256;
 }
 
 - (MTLReadWriteTextureTier)readWriteTextureSupport { return MTLReadWriteTextureTier2; }
